@@ -1,0 +1,23 @@
+{
+  "batch_candidate": true,
+  "evidence": {
+    "enumerable_objects": true,
+    "decomposable_actions": false,
+    "aggregatable_results": true,
+    "ordering_dependencies": true,
+    "external_rate_limits": false,
+    "sensitive_side_effects": true,
+    "idempotency_or_lookup": false,
+    "explicit_top_n": false,
+    "multi_object_action": true
+  },
+  "assessment_sources": [
+    "user_intent",
+    "skill_files"
+  ],
+  "user_decision": "disable",
+  "execution_mode": null,
+  "read_only": false,
+  "max_items": null,
+  "single_item_retry": false
+}

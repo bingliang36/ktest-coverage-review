@@ -1,0 +1,8 @@
+{
+  "name": "ktest-coverage-review",
+  "version": "1.0.0",
+  "ks-meta": {
+    "displayName": "KTest覆盖率核验",
+    "platform": ["MyFlicker-Work模式", "MyFlicker-Code模式"]
+  }
+}

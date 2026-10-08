@@ -1,0 +1,14 @@
+{
+  "long_running": true,
+  "confidence": "high",
+  "evidence": [
+    "long_timeout"
+  ],
+  "assessment_sources": [
+    "skill_files"
+  ],
+  "a2a_chat_sync": false,
+  "runner": "call_remote_agent",
+  "method": "CALLBACK",
+  "needs_remote_guard": true
+}
