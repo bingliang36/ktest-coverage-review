@@ -1,6 +1,6 @@
 ---
 name: ktest-coverage-review
-description: 本技能用于核验和拉取 KTest 覆盖率报告、精准测试报告、KDev 流水线日志与 GitLab 代码，并生成证据报告。当用户提供 KTest 覆盖率链接、cid、精准测试 taskId/链接、KDev feature 链接或 GitLab 分支链接，要求验证覆盖率数据、接口可信度、日志是否完整、代码是否对齐时使用。不触发于通用代码审查、KAT 用例明细分析、线上故障排查或批量处理多个报告。
+description: 本技能用于核验和拉取 KTest 覆盖率报告、精准测试报告、KDev 流水线日志与 GitLab 代码，并基于这些证据进行覆盖率诊断、达标路径分析和测试样例生成。当用户提供任意项目的 KTest 覆盖率链接/cid、精准测试 taskId/链接、KDev feature 链接或 GitLab 分支/仓库地址，要求验证数据完整性、分析覆盖率、定位未覆盖代码或生成测试建议时使用。不触发于通用代码审查、KAT 用例明细分析、线上故障排查或批量处理多个报告。
 ---
 
 # KTest 覆盖率核验
@@ -12,7 +12,17 @@ description: 本技能用于核验和拉取 KTest 覆盖率报告、精准测试
 - KDev feature 流水线: 准出流水线 job 清单、全量日志与错误日志。
 - GitLab 代码: 分支代码、commit 对齐与文件清单。
 
-不支持批量处理。一次只处理一个 cid、一个 taskId、一个 KDev feature 链接或一个 GitLab 分支链接。
+不支持批量处理。一次只处理一个项目的一组数据：一个增量 cid、一个 taskId、一个 KDev feature 链接和一个代码目录。命令中的项目 ID、分支、仓库、cid、taskId 都必须来自用户输入或已成功拉取的数据，不得写死示例项目值。
+
+## 分析原则与能力
+
+分析层只消费已通过完整性检查的四样数据，不重新猜测或补造数据。每个结论必须能回溯到报告字段、源码行或明确的计算公式；无法从现有数据确认的内容直接标记“无法判断”，不输出确定性结论。
+
+- **官方结论**：原样展示 KTest/精准测试平台的 pass、风险和阈值，不用自定义结论覆盖官方口径。
+- **该测未测**：依据精准测试方法级增量覆盖率，以及 KTest `diff==1 && covered==1` 的变更行交集定位。
+- **疑似冗余提示**：只展示变更未覆盖行和部分覆盖行及源码，供研发确认；不擅自认定代码冗余，不做全仓库调用链溯源。
+- **达标路径**：按 KTest 增量行覆盖率公式计算目标缺口，按未覆盖变更行数排序推荐补测方法；支持自定义目标覆盖率。
+- **测试样例**：只针对诊断出的未覆盖方法生成基于真实签名、依赖字段和源码的 JUnit 骨架；业务断言必须由研发补充。
 
 ## 四样数据与对应命令
 
@@ -96,13 +106,41 @@ uv run <skill_directory>/scripts/fetch_accuracy.py --from-log data/kdev/<feature
 uv run <skill_directory>/scripts/coverage_review.py kdev --feature-url '<kdev_feature_url>' --out tmp/kdev-feature-<id>
 ```
 
-5. 如目标是验证页面路由和后端接口映射，执行命令:
+5. 在进入分析前，必须执行四样数据完整性检查:
+
+```bash
+uv run <skill_directory>/scripts/coverage_review.py check \
+  --cid <增量cid> --feature-id <featureId> --task-id <taskId> \
+  --code-dir <代码目录> --data-root <data目录>
+```
+
+   只有 check 返回“四样数据齐全且完整”后，才允许进入分析；任何一项未获取或不完整，都必须直接告知用户缺少哪项。
+
+6. 完整性检查通过后，执行覆盖率诊断:
+
+```bash
+uv run <skill_directory>/scripts/analyze.py \
+  --task-id <taskId> --cid <增量cid> \
+  --data-root <data目录> --code-dir <代码目录>
+```
+
+   如需评估自定义目标覆盖率:
+
+```bash
+uv run <skill_directory>/scripts/analyze.py \
+  --task-id <taskId> --cid <增量cid> \
+  --data-root <data目录> --code-dir <代码目录> --target <百分比>
+```
+
+   分析报告包括：官方结论、该测未测方法、变更未覆盖行、部分覆盖行、疑似冗余提示、达标路径和测试样例骨架。
+
+7. 如目标是验证页面路由和后端接口映射，执行命令:
 
 ```bash
 uv run <skill_directory>/scripts/coverage_review.py verify --cid <cid> --out tmp/ktest-verify-<cid>
 ```
 
-6. 返回结果时列出生成文件路径、核心统计、证据来源和仍未覆盖的边界。
+8. 返回结果时列出生成文件路径、核心统计、证据来源和仍未覆盖的边界。所有命令中的 `<...>` 均为本次用户输入或取数结果，不得替换成固定示例值。
 
 ## 输出
 
@@ -113,6 +151,12 @@ uv run <skill_directory>/scripts/coverage_review.py verify --cid <cid> --out tmp
 - `verification_<cid>.md`: 前端路由与后端接口映射核验证据。
 - `kdev_feature_<id>.json`: KDev feature 与流水线元信息。
 - `logs/`: KDev 各 job 全量日志和错误日志。
+- `analysis_<taskId>_<cid>.md`: 覆盖率诊断报告(含该测未测/疑似冗余/达标路径/测试样例)。
+- `data_check_*.md`: 四样数据完整性检查报告。
+
+## 通用性
+
+本技能是**通用型工具**，可处理任意项目的 KTest 覆盖率报告。SKILL.md 中出现的具体 `cid`/`taskId` 等值仅为接口实测记录，不构成对任何特定项目的绑定。所有参数必须由用户本次输入或取数结果提供。
 
 ## 参考资料
 

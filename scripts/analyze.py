@@ -51,8 +51,11 @@ def collect_method_evidence(acc: dict) -> list[dict]:
         out.append({
             "idx": i,
             "fullName": m.get("fullName", ""),
+            "fullClazzName": m.get("fullClazzName", ""),
             "shortName": m.get("shortName", ""),
             "jarPath": m.get("jarPath", ""),
+            "inputArgs": m.get("inputArgs", ""),
+            "outputArgs": m.get("outputArgs", ""),
             "changeType": m.get("changeType"),
             "methodType": m.get("methodType"),
             "methodCategory": m.get("methodCategory"),
@@ -155,7 +158,243 @@ def pct(v, nd=0) -> str:
     return f"{v * 100:.{nd}f}%"
 
 
-# ---------- 冗余/低效代码识别(有依据,纯提示) ----------
+# ---------- 测试样例生成(5) ----------
+
+def extract_method_source(code_dir: Path, jar_path: str, full_clazz: str, start_line: int | None = None) -> str | None:
+    """从代码目录按 jarPath 定位源文件,提取方法的源码实现(供测试样例参考)。
+
+    jar_path 形如 com/x/y/Foo.java;在代码目录下按 basename + 路径后缀定位。
+    优先用 changeRanges 的 startLine 定位方法体起点(平台给的行号,权威);
+    无 startLine 时退化为方法名匹配(可能不准,标注)。
+    返回方法体文本(从 startLine 到方法闭合),找不到返回 None(诚实,不编造)。
+    """
+    if not code_dir:
+        return None
+    base = jar_path.split("/")[-1]
+    target = None
+    for p in Path(code_dir).rglob("*.java"):
+        if p.name == base and (str(p).endswith(jar_path) or base == p.name):
+            target = p
+            break
+    if target is None:
+        return None
+    try:
+        src = target.read_text(encoding="utf-8").split("\n")
+    except Exception:
+        return None
+    i0 = None
+    if start_line:
+        # startLine 是方法声明行(changeRanges 起点),从那里开始数括号
+        i0 = start_line - 1
+    else:
+        meth = full_clazz.split("#")[-1].split("(")[0]
+        for i, line in enumerate(src):
+            if re.search(rf"\b{re.escape(meth)}\s*\(", line):
+                i0 = i
+                break
+    if i0 is None:
+        return None
+    depth = 0
+    started = False
+    buf = []
+    for ln in src[i0:]:
+        buf.append(ln)
+        depth += ln.count("{") - ln.count("}")
+        if "{" in ln:
+            started = True
+        if started and depth <= 0:
+            break
+    return "\n".join(buf)
+
+
+def extract_injected_fields(code_dir: Path, jar_path: str) -> list[str]:
+    """从源码提取依赖注入字段(有依据: 非 static 的成员变量),用于生成 @Mock/@InjectMocks。"""
+    if not code_dir:
+        return []
+    base = jar_path.split("/")[-1]
+    target = None
+    for p in Path(code_dir).rglob("*.java"):
+        if p.name == base:
+            target = p
+            break
+    if target is None:
+        return []
+    fields = []
+    try:
+        for line in target.read_text(encoding="utf-8").split("\n"):
+            s = line.strip()
+            # 非 static 的成员变量: private Xxx name; 或 private Xxx name = ...
+            m = re.match(r"private\s+(?:final\s+)?([A-Za-z_][\w<>\[\],\s]*?)\s+(\w+)\s*[;=]", s)
+            if m and "static" not in s:
+                fields.append(f"{m.group(1)} {m.group(2)}")
+    except Exception:
+        return []
+    return fields
+
+
+def render_test_section(acc: dict, cov: dict, code_dir: str, missing_methods: list) -> list[str]:
+    """生成测试样例(只对该测未测方法)。全部基于签名+源码,不编造业务断言。"""
+    L = []
+    L.append("## 6. 测试样例生成(基于源码,需研发补充断言)")
+    L.append("")
+    if not missing_methods:
+        L.append("- 无该测未测方法,无需生成测试。")
+        return L
+    for m in missing_methods:
+        short = m.get("shortName", "")
+        fcn = m.get("fullClazzName") or ""
+        clz = fcn.split("#")[0]
+        meth_full = fcn.split("#")[-1] if "#" in fcn else ""
+        meth = meth_full.split("(")[0]  # 方法名(不含参数)
+        inp = m.get("inputArgs") or "()"
+        out = m.get("outputArgs") or "void"
+        jar = m.get("jarPath") or ""
+        L.append(f"### {short}")
+        L.append("")
+        L.append(f"- 签名: `{clz}#{meth}`")
+        L.append(f"- 输入: `{inp}` | 输出: `{out}`")
+        L.append(f"- 变更类型: {m.get('changeType')} | 增量覆盖率: {pct(m.get('increCoverage'))}")
+        L.append("")
+        cr = (m.get("changeRanges") or [])
+        start_line = cr[0].get("startLine") if cr else None
+        src = extract_method_source(Path(code_dir), jar, m.get("fullClazzName") or "", start_line) if code_dir else None
+        if src is None and code_dir:
+            L.append("> ⚠️ 未在代码目录定位到该方法源码(`jarPath` 可能不含模块前缀),测试样例仅基于签名,断言需研发补充。")
+            L.append("")
+        fields = extract_injected_fields(Path(code_dir), jar) if code_dir else []
+        L.append("```java")
+        L.append(f"// 测试类: {clz.split('.')[-1]}Test")
+        L.append(f"// 被测方法: {meth}")
+        L.append("// 注意: 以下为骨架,断言基于源码可见行为;业务期望值需研发确认。")
+        L.append("")
+        L.append("@ExtendWith(MockitoExtension.class)")
+        L.append(f"class {clz.split('.')[-1]}Test {{")
+        if fields:
+            for f in fields:
+                L.append(f"    @Mock private {f};")
+            L.append("")
+            L.append("    @InjectMocks")
+            L.append(f"    private {clz.split('.')[-1]} service;")
+        else:
+            L.append(f"    private {clz.split('.')[-1]} service = new {clz.split('.')[-1]}();")
+        L.append("")
+        L.append("    @Test")
+        L.append(f"    void should_{meth}() {{")
+        L.append("        // given: 构造输入参数(依据签名)")
+        L.append(f"        //   {inp}")
+        L.append("        // when: 调用被测方法")
+        L.append(f"        //   {out} result = service.{meth}(...);")
+        L.append("        // then: 断言(需研发根据业务补充)")
+        L.append("        //   assertNotNull(result);")
+        L.append("    }")
+        L.append("}")
+        L.append("```")
+        if src:
+            L.append("")
+            L.append("源码参考(方法实现):")
+            L.append("```java")
+            for sl in src.split("\n")[:25]:
+                L.append(sl)
+            L.append("```")
+        L.append("")
+    return L
+
+def coverage_gap(coverage: dict, target_pct: float) -> dict:
+    """计算达到目标增量覆盖率还差多少行。全部基于报告数据,不猜。
+
+    口径(KTest): diffLineCoverage = (diffOk + diffPart) / diff
+    - part(部分覆盖)已计入分子,补全覆盖不增加覆盖率
+    - 只有 miss(未覆盖变更行)补掉才提升覆盖率
+    目标覆盖率 target_pct(0-100)。
+    """
+    agg = coverage.get("aggregate") or {}
+    diff = agg.get("diff") or 0
+    ok = agg.get("diffOk") or 0
+    part = agg.get("diffPart") or 0
+    miss = agg.get("diffMiss") or 0
+    if not diff:
+        return None
+    cur = (ok + part) / diff
+    need_total = max(0, int(target_pct / 100 * diff + 0.999))  # 向上取整
+    need_rows = max(0, need_total - (ok + part))  # 还差多少行(全从 miss 补)
+    return {
+        "diff": diff, "ok": ok, "part": part, "miss": miss,
+        "current": cur,
+        "target": target_pct,
+        "need_rows": need_rows,
+        "covered_now": ok + part,
+        "reachable": need_rows <= miss,  # 差的行数是否 <= 未覆盖数
+    }
+
+
+def rank_methods_to_cover(coverage: dict, acc: dict, code_dir: str) -> list[dict]:
+    """按"方法未覆盖变更行数"排序,推荐优先补测方法。
+
+    依据: 每个变更文件的 diffMiss(diff 行里未覆盖数) + 精准测试报告的方法级数据。
+    排序键: 未覆盖变更行数(降序), 其次看方法级增量覆盖率(升序,低的优先)。
+    """
+    # 文件级: className -> diffMiss
+    file_miss = {}
+    for f in coverage.get("files") or []:
+        st = f.get("stats") or {}
+        file_miss[f.get("className")] = {
+            "diff": st.get("diff", 0),
+            "diffMiss": st.get("diffMiss", 0),
+            "diffPart": st.get("diffPart", 0),
+        }
+    # 方法级: 精准测试报告
+    methods = []
+    for m in (acc.get("testReport") or {}).get("testMethodList") or []:
+        cn = (m.get("shortName") or "").split("#")[0].split(".")[-1]
+        fm = file_miss.get(cn, {})
+        methods.append({
+            "shortName": m.get("shortName"),
+            "increCoverage": m.get("increCoverage"),
+            "fileMiss": fm.get("diffMiss", 0),
+            "fileDiff": fm.get("diff", 0),
+        })
+    methods.sort(key=lambda x: (-x["fileMiss"], x["increCoverage"] or 0))
+    return methods
+
+
+def render_gap_section(coverage: dict, acc: dict, code_dir: str, target_pct: float) -> list[str]:
+    """渲染"达标路径"章节。"""
+    L = []
+    L.append("## 5. 达标路径(覆盖率缺口分析)")
+    L.append("")
+    agg = coverage.get("aggregate") or {}
+    thr = coverage.get("threshold")
+    eff_target = target_pct if target_pct is not None else (thr if thr is not None else 60)
+    # threshold 可能来自 JSON,实测是字符串 "60";统一转 float
+    try:
+        eff_target = float(str(eff_target).rstrip("%"))
+    except (TypeError, ValueError):
+        eff_target = 60.0
+    gap = coverage_gap(coverage, eff_target)
+    if not gap:
+        L.append("- 无变更行数据,无法计算缺口。")
+        return L
+    L.append(f"- 当前增量覆盖率: **{pct(gap['current'] * 100, 1)}** (diff={gap['diff']}: ok={gap['ok']} part={gap['part']} miss={gap['miss']})")
+    L.append(f"- 目标增量覆盖率: **{eff_target}%**(卡点阈值 {thr}%)")
+    L.append(f"- 还差 **{gap['need_rows']} 行**达到目标(需从 miss 中补覆盖)")
+    if gap["reachable"]:
+        L.append(f"- ✅ 可达: 未覆盖变更行数({gap['miss']}) ≥ 还差行数({gap['need_rows']})")
+    else:
+        L.append(f"- ⚠️ 不可达: 未覆盖变更行({gap['miss']}) < 还差行数({gap['need_rows']}),需考虑排除疑似冗余或提高测试充分度")
+    L.append("")
+    L.append("### 5.1 推荐优先补测方法(按未覆盖变更行数排序)")
+    L.append("")
+    methods = rank_methods_to_cover(coverage, acc, code_dir)
+    if methods:
+        L.append("| 方法 | 文件级未覆盖变更行 | 文件级变更行 | 方法级增量覆盖率 |")
+        L.append("|---|---|---|---|")
+        for m in methods:
+            if m["fileMiss"] > 0 or (m["increCoverage"] or 0) < 1.0:
+                L.append(f"| {m['shortName']} | {m['fileMiss']} | {m['fileDiff']} | {pct(m['increCoverage'])} |")
+    else:
+        L.append("- 无变更方法数据。")
+    L.append("")
+    return L
 
 def load_source_map(code_dir: Path, line_files: dict) -> dict:
     """按 (filePath, line) 构建源码行映射,供报告中展示变更未覆盖行的代码内容。
@@ -239,7 +478,7 @@ def judge_missing(method: dict, range_miss: list) -> dict:
 
 # ---------- 报告渲染 ----------
 
-def render_report(acc: dict, cov: dict, code_dir: str | None, evidence) -> str:
+def render_report(acc: dict, cov: dict, code_dir: str | None, evidence, target_pct: float | None = None) -> str:
     methods, official = evidence  # (list, dict)
     line_files = collect_line_evidence(cov)
 
@@ -264,10 +503,13 @@ def render_report(acc: dict, cov: dict, code_dir: str | None, evidence) -> str:
     # 2. 各方法诊断
     lines.append("## 2. 变更方法诊断")
     lines.append("")
+    missing_methods = []  # 该测未测的方法(供第 6 节生成测试)
     for m in methods:
         finfo_key, finfo = link_method_to_file(m, line_files)
         rmiss = range_miss_lines(finfo, m["changeRanges"]) if finfo else []
         diag = judge_missing(m, rmiss)
+        if diag["is_missing"]:
+            missing_methods.append(m)
         lines.append(f"### {m['shortName']}")
         lines.append("")
         lines.append(f"- changeType={m['changeType']} | 增量覆盖率={pct(m['increCoverage'])} | 全量覆盖率={pct(m['fullCoverage'])} | 影响链路={m['affectedLink']}(未覆盖{m['unCoveredLink']})")
@@ -375,15 +617,22 @@ def render_report(acc: dict, cov: dict, code_dir: str | None, evidence) -> str:
             lines.append("- 无未覆盖变更行可模拟。")
         lines.append("")
 
+    # ---- 5. 达标路径 ----
+    lines.extend(render_gap_section(cov, acc, code_dir, target_pct))
+
+    # ---- 6. 测试样例生成 ----
+    lines.extend(render_test_section(acc, cov, code_dir, missing_methods))
+
     return "\n".join(lines)
 
 
 def main():
-    p = argparse.ArgumentParser(description="覆盖率诊断: 该测未测(有依据)")
+    p = argparse.ArgumentParser(description="覆盖率诊断: 该测未测 + 冗余提示 + 达标路径(有依据)")
     p.add_argument("--task-id", type=int, required=True, help="精准测试 taskId")
     p.add_argument("--cid", type=int, required=True, help="KTest 增量覆盖率 cid")
     p.add_argument("--data-root", default=str(WS / "data"), help="数据根目录")
     p.add_argument("--code-dir", default=None, help="代码目录(可选,核对行号)")
+    p.add_argument("--target", type=float, default=None, help="目标增量覆盖率%%,默认用 KTest 卡点阈值")
     p.add_argument("--outdir", default=str(WS / "tmp"), help="输出目录")
     a = p.parse_args()
 
@@ -408,7 +657,7 @@ def main():
             f"需确认是否同一 MR。")
 
     evidence = collect_method_evidence(acc)
-    report = render_report(acc, cov, a.code_dir, evidence)
+    report = render_report(acc, cov, a.code_dir, evidence, a.target)
 
     out = Path(a.outdir)
     out.mkdir(parents=True, exist_ok=True)
