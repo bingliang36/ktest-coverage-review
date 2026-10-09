@@ -106,6 +106,12 @@ uv run <skill_directory>/scripts/fetch_accuracy.py --from-log data/kdev/<feature
 uv run <skill_directory>/scripts/coverage_review.py kdev --feature-url '<kdev_feature_url>' --out tmp/kdev-feature-<id>
 ```
 
+   `kdev` 子命令内部自动完成三步，**taskId 无需用户提供且绝不写死**：
+   1. `kdev/feature/detail` 校验 feature 真实身份(取 title)，防止拿错 feature；
+   2. `artemis/task/feature/latest` 动态解析当前生效的 taskId(一个 feature 可能挂多个测试任务)；
+   3. 用动态 taskId 调 `pass/pipeline` 拉准出流水线，落盘时记录 featureTitle/taskId/branch/commitId。
+   产出 `kdev_feature_<id>.json` 同时包含 feature 身份与流水线数据，供后续交叉核对。
+
 5. 在进入分析前，必须执行四样数据完整性检查:
 
 ```bash

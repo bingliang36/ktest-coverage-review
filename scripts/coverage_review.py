@@ -102,6 +102,15 @@ class InternalClient:
         data = self.request_json("GET", base + path, params=params)
         return data.get("data")
 
+    def get_raw(self, base: str, path: str, params: Optional[Dict[str, Any]] = None) -> bytes:
+        """原始响应(非 JSON),用于全量日志下载等场景。"""
+        try:
+            resp = self.session.request("GET", base + path, params=params)
+            resp.raise_for_status()
+            return resp.content
+        except Exception as exc:
+            raise SkillError("API_ERROR", f"接口请求失败: {base + path}: {exc}", 1, "report_api_failure") from exc
+
 
 class KTestClient:
     def __init__(self, http: InternalClient):
@@ -336,12 +345,28 @@ class KDevClient:
     def __init__(self, http: InternalClient):
         self.http = http
 
-    def pass_pipeline(self, feature_id: str) -> Dict[str, Any]:
+    def feature_detail(self, feature_id: str, biz_id: int = 84) -> Dict[str, Any]:
+        """feature 真实身份(校验用): title / status / owner / 空间。"""
+        return self.http.get_data(KDEV, "/api/kdev/feature/detail", {"id": feature_id, "bizId": biz_id})
+
+    def task_latest(self, feature_id: str) -> Dict[str, Any]:
+        """按 feature 动态解析「当前生效的测试任务」,返回 {exist, taskType, taskId}。
+
+        ⚠️ taskId 不能写死:同一个 feature 可能挂多个测试任务(页面「切换测试任务 (n)」),
+        写死会拉到别的 feature 的准出流水线(实测: taskId=500685 是 feature 270240 的,
+        用它拉 273635 会静默拿到 270240 的旧数据)。
+        """
+        return self.http.get_data(KDEV, "/api/artemis/task/feature/latest", {
+            "featureId": feature_id,
+            "filterSkipTest": "false",
+        })
+
+    def pass_pipeline(self, feature_id: str, task_id: int) -> Dict[str, Any]:
         return self.http.get_data(KDEV, "/api/artemis/task/pass/pipeline", {
             "sourceId": feature_id,
             "relationType": 3,
             "testType": 1,
-            "taskId": 500685,
+            "taskId": task_id,
             "disableCache": "false",
         })
 
@@ -349,9 +374,34 @@ class KDevClient:
         return self.http.get_data(KDEV, "/api/kdev/pipeline/pipelineJobLog", {"id": job_id})
 
     def job_log(self, job_id: int, error: bool = False) -> str:
+        """优先 download 全量接口;失败时按 offset 读取全部增量日志。"""
+        if not error:
+            try:
+                raw = self.http.get_raw(KDEV, "/api/kdev/pipeline/job/log/download", {"id": job_id})
+                return raw.decode("utf-8", errors="replace")
+            except SkillError:
+                pass  # 退化到增量流
         path = "/api/kdev/pipeline/pipelineJobLog/errorLog" if error else "/api/kdev/pipeline/pipelineJobLog/log"
-        data = self.http.get_data(KDEV, path, {"id": job_id, "start": 0})
-        return (data or {}).get("content") or ""
+        chunks = []
+        start = 0
+        while True:
+            try:
+                data = self.http.get_data(KDEV, path, {"id": job_id, "start": start}) or {}
+            except SkillError as exc:
+                if error:
+                    print(f"[warning] job {job_id} 错误日志获取失败: {exc.msg}", file=sys.stderr)
+                    return "".join(chunks)
+                raise
+            chunks.append(data.get("content") or "")
+            if not data.get("hasMore"):
+                return "".join(chunks)
+            try:
+                offset = int(data.get("offset"))
+            except (TypeError, ValueError) as exc:
+                raise SkillError("API_ERROR", f"job {job_id} 日志分页缺少有效 offset") from exc
+            if offset <= start:
+                raise SkillError("API_ERROR", f"job {job_id} 日志分页 offset 未前进")
+            start = offset
 
 
 def parse_feature_id(url: str) -> str:
@@ -370,16 +420,46 @@ def kdev_cmd(args: argparse.Namespace, start_ms: int) -> None:
     if not args.feature_url:
         raise SkillError("MISSING_ARGUMENT", "缺少 --feature-url", 2, "ask_for_feature_url")
     fid = parse_feature_id(args.feature_url)
+    query = urllib.parse.parse_qs(urllib.parse.urlparse(args.feature_url).query)
+    try:
+        biz_id = int(query.get("bizId", ["84"])[0])
+    except (TypeError, ValueError) as exc:
+        raise SkillError("INVALID_URL", "KDev feature URL 中 bizId 无效", 2, "ask_for_valid_url") from exc
     out = ensure_out(args.out or f"tmp/kdev-feature-{fid}")
     logs_dir = out / "logs"
     logs_dir.mkdir(exist_ok=True)
     http = InternalClient()
     client = KDevClient(http)
-    data = client.pass_pipeline(fid)
-    items = data.get("list") or []
+
+    # 1) feature 身份校验: 确认 fid 真实存在,并拿到 title(落盘时一并记录,防止拿错 feature)
+    feat = client.feature_detail(fid, biz_id=biz_id)
+    feat_title = (feat or {}).get("title") or ""
+    if not feat_title:
+        raise SkillError("FEATURE_NOT_FOUND", f"feature {fid} 不存在或无权访问", 2, "ask_for_valid_url")
+
+    # 2) 动态解析当前生效的测试任务 taskId(绝不写死)
+    task = client.task_latest(fid)
+    task_id = (task or {}).get("taskId")
+    if not task_id or not (task or {}).get("exist"):
+        raise SkillError("TASK_NOT_FOUND", f"feature {fid} 没有可用的测试任务(task/feature/latest 返回空)", 2, "ask_for_valid_url")
+    try:
+        task_id = int(task_id)
+    except (TypeError, ValueError) as exc:
+        raise SkillError("API_ERROR", f"feature {fid} 返回无效 taskId: {task_id}") from exc
+
+    # 3) 用动态 taskId 拉准出流水线(分支/commit/流水线日志)
+    data = client.pass_pipeline(fid, task_id)
+    items = (data or {}).get("list") or []
     if not items:
         raise SkillError("API_ERROR", f"feature {fid} 没有准出流水线数据", 1, "report_no_pipeline")
     branch = items[0]
+
+    # 4) 检查分支字段完整性;归属仍需结合 feature 关联分支核对。
+    branch_name = branch.get("branch") or ""
+    commit_id = branch.get("commitId") or ""
+    if not branch_name:
+        raise SkillError("DATA_MISMATCH", "pass/pipeline 返回的 branch 为空,疑似数据异常", 1, "report_diagnostic")
+
     jobs = []
     for pipe in branch.get("pipelineList") or []:
         plog = pipe.get("pipelineLog") or {}
@@ -396,10 +476,19 @@ def kdev_cmd(args: argparse.Namespace, start_ms: int) -> None:
                 err_file = logs_dir / f"{jid}_{safe_name(name)}.error.log"
                 err_file.write_text(err, encoding="utf-8")
             jobs.append({"jobLogId": jid, "name": name, "status": job.get("statusDesc") or job.get("status"), "meta": meta, "log": str(log_file), "errorLog": str(err_file) if err_file else None})
-    payload = {"featureId": fid, "branch": branch, "jobs": jobs}
+    payload = {
+        "featureId": fid,
+        "featureTitle": feat_title,
+        "taskId": task_id,
+        "branch": branch,
+        "jobs": jobs,
+    }
     out_file = out / f"kdev_feature_{fid}.json"
     out_file.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
-    emit(True, 0, "KDev 日志已拉取", data={"output": str(out_file), "jobCount": len(jobs), "logsDir": str(logs_dir)}, start_ms=start_ms)
+    emit(True, 0, "KDev 日志已拉取", data={
+        "output": str(out_file), "jobCount": len(jobs), "logsDir": str(logs_dir),
+        "featureTitle": feat_title, "taskId": task_id, "branch": branch_name, "commitId": commit_id,
+    }, start_ms=start_ms)
 
 
 def git_clone_cmd(git_url: str, branch: Optional[str], dest: Path) -> Dict[str, Any]:

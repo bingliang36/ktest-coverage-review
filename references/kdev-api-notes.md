@@ -33,7 +33,10 @@ logs/<jobLogId>_<name>.error.log   错误日志(各阶段单独的错误流)
 
 | 方法 | 路径 | 用途 |
 |---|---|---|
-| GET | `/api/artemis/task/pass/pipeline?sourceId={featureId}&relationType=3&testType=1&taskId=500685` | **唯一入口**:分支(branch/commitId/repoId) + pipelineList + pipelineLog.jobLogList |
+| GET | `/api/kdev/feature/detail?id={featureId}&bizId={bizId}` | **feature 身份校验**:title/status/owner(防止拿错 feature) |
+| GET | `/api/artemis/task/feature/latest?featureId={featureId}&filterSkipTest=false` | **动态解析当前生效 taskId**(返回 `{exist, taskType, taskId}`)。**taskId 不能写死!** |
+| GET | `/api/artemis/task/pass/pipeline?sourceId={featureId}&relationType=3&testType=1&taskId={taskId}` | **准出流水线唯一入口**:分支(branch/commitId/repoId) + pipelineList + pipelineLog.jobLogList |
+| GET | `/api/kdev/feature/relation/branch/list/v2?featureId={featureId}` | feature 关联的全部分支(核对 GitLab 分支是否属于该 feature) |
 | GET | `/api/kdev/pipeline/pipelineJobLog?id={jobLogId}` | job 元信息(name/stage/status/halo/onCall) |
 | GET | `/api/kdev/pipeline/pipelineJobLog/log?id={jobLogId}&start=0` | 增量日志流 `{content, offset, hasMore}` |
 | GET | `/api/kdev/pipeline/pipelineJobLog/errorLog?id={jobLogId}&start=0` | 错误日志流(仅错误) |
@@ -41,12 +44,26 @@ logs/<jobLogId>_<name>.error.log   错误日志(各阶段单独的错误流)
 
 kdev 返回统一包 `{status:200, message, data}`。
 
+### ⚠️ taskId 为什么不能写死(血泪教训)
+
+`pass/pipeline` 的 `taskId` 决定返回**哪个 feature 的准出流水线**:
+- `taskId=500685` 是 feature 270240「COMPOSE产出为空修复」的测试任务
+- `taskId=504825` 是 feature 273635「编译中任务--重复调用--信号补偿」的测试任务
+
+脚本曾写死 `500685`,导致**任何 feature-url 拉到的一律是 270240 的数据**(分支 `feature_fix_compose_empty`),
+用户传 273635 时静默拿到 270240 的数据,引发"KDev 分支和 GitLab 分支对不上"的误判。
+
+**同一个 feature 也可能挂多个测试任务**(页面「切换测试任务 (n)」),
+必须用 `task/feature/latest` 动态解析当前生效的 taskId,再调 `pass/pipeline`。
+
 ### 树形结构(从 feature 到日志)
 
 ```
-featureDetail?id=270240
-  └─ artemis/task/pass/pipeline  → data.list[0]
-       ├─ branch / commitId / repoId / repoUrl
+featureDetail?id=273635
+  ├─ kdev/feature/detail          → title「编译中任务--重复调用--信号补偿」
+  ├─ artemis/task/feature/latest  → taskId=504825  ← 动态解析
+  └─ artemis/task/pass/pipeline (sourceId=273635, taskId=504825)  → data.list[0]
+       ├─ branch / commitId / repoId / repoUrl   (feature_T12383780...@dd031053)
        └─ pipelineList[i].pipelineLog.jobLogList
             └─ 15 个 job {id, name, statusDesc, stage}
                  └─ pipelineJobLog + log + errorLog + download
@@ -70,6 +87,8 @@ featureDetail?id=270240
 4. **jobLogId 浮点化** → 接口返回字符串/数字混合,归一成 int。
 5. **KAT 报告域名** → `kat.corp.kuaishou.com` 已合并进 `ktest.corp.kuaishou.com`,访问会跳转。
 6. **KAT 失败用例明细** → 报告页 SPA 默认表格空,需 UI 过滤才加载;接口反推中。产物里已含 KAT runtimeId 和 checkUrl,可另行深挖。
+7. **pass/pipeline 的 taskId 写死** → 静默拉错 feature(见上文「taskId 为什么不能写死」)。必须 `task/feature/latest` 动态解析。
+8. **job_log 用增量流(log 接口)只取 start=0** → 日志被截断在 ~50KB(Java 编译本该 1.8MB)。用 `job/log/download` 全量接口。
 
 ## 已验证
 

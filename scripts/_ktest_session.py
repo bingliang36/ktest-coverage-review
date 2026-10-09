@@ -15,7 +15,21 @@ import subprocess
 import sys
 
 WS = os.environ.get('COVFETCH_WS') or os.getcwd()
-KBROWSE = os.path.join(WS, 'skills/agent-browser/scripts/kbrowse.sh')
+# kbrowse.sh 定位: 优先按 skill 目录向上找 workspace(挂了 skills/agent-browser),
+# 其次按 COVFETCH_WS 环境变量,最后回退到 cwd 下的约定路径。
+def _find_kbrowse():
+    cands = [
+        os.environ.get('KBROWSE'),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'skills', 'agent-browser', 'scripts', 'kbrowse.sh'),
+        os.path.join(WS, 'skills', 'agent-browser', 'scripts', 'kbrowse.sh'),
+    ]
+    for c in cands:
+        # 用 bash 调用,不需要 x 执行位(仓库里 kbrowse.sh 是 644)
+        if c and os.path.isfile(c) and os.access(c, os.R_OK):
+            return os.path.abspath(c)
+    raise RuntimeError('找不到 kbrowse.sh,请设置 KBROWSE 或 COVFETCH_WS')
+
+KBROWSE = None
 BASE = 'https://ktest.corp.kuaishou.com'
 
 
@@ -32,6 +46,8 @@ class KTestSession:
             print(f'[ktest] {msg}', file=sys.stderr)
 
     def __enter__(self):
+        global KBROWSE
+        KBROWSE = _find_kbrowse()
         self.sid = subprocess.run(
             ['bash', KBROWSE, 'new-session'],
             capture_output=True, text=True, check=True).stdout.strip()
