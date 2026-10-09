@@ -102,14 +102,14 @@ class InternalClient:
         data = self.request_json("GET", base + path, params=params)
         return data.get("data")
 
-    def get_raw(self, base: str, path: str, params: Optional[Dict[str, Any]] = None) -> bytes:
-        """原始响应(非 JSON),用于全量日志下载等场景。"""
+    def get_response(self, base: str, path: str, params: Optional[Dict[str, Any]] = None):
+        url = base + path
         try:
-            resp = self.session.request("GET", base + path, params=params)
+            resp = self.session.request("GET", url, params=params)
             resp.raise_for_status()
-            return resp.content
+            return resp
         except Exception as exc:
-            raise SkillError("API_ERROR", f"接口请求失败: {base + path}: {exc}", 1, "report_api_failure") from exc
+            raise SkillError("API_ERROR", f"接口请求失败: {url}: {exc}", 1, "report_api_failure") from exc
 
 
 class KTestClient:
@@ -345,63 +345,91 @@ class KDevClient:
     def __init__(self, http: InternalClient):
         self.http = http
 
-    def feature_detail(self, feature_id: str, biz_id: int = 84) -> Dict[str, Any]:
-        """feature 真实身份(校验用): title / status / owner / 空间。"""
-        return self.http.get_data(KDEV, "/api/kdev/feature/detail", {"id": feature_id, "bizId": biz_id})
+    def feature_detail(self, feature_id: str) -> Dict[str, Any]:
+        return self.http.get_data(KDEV, "/api/kdev/feature/detail", {"id": feature_id})
 
-    def task_latest(self, feature_id: str) -> Dict[str, Any]:
-        """按 feature 动态解析「当前生效的测试任务」,返回 {exist, taskType, taskId}。
-
-        ⚠️ taskId 不能写死:同一个 feature 可能挂多个测试任务(页面「切换测试任务 (n)」),
-        写死会拉到别的 feature 的准出流水线(实测: taskId=500685 是 feature 270240 的,
-        用它拉 273635 会静默拿到 270240 的旧数据)。
-        """
-        return self.http.get_data(KDEV, "/api/artemis/task/feature/latest", {
-            "featureId": feature_id,
-            "filterSkipTest": "false",
+    def relation_team_list(self, feature_id: str) -> Dict[str, Any]:
+        return self.http.get_data(KDEV, "/api/kdev/workbench/v2/feature/relation/team/list", {
+            "bizType": "feature",
+            "bizId": feature_id,
         })
 
     def pass_pipeline(self, feature_id: str, task_id: int) -> Dict[str, Any]:
+        """拉取指定 feature 关联任务的准出流水线。
+
+        task_id 必须来自本次输入或 feature 详情动态解析，不能在脚本中写死。
+        线上实测表明该接口主要按 taskId 返回流水线，sourceId 不能作为唯一归属依据。
+        """
         return self.http.get_data(KDEV, "/api/artemis/task/pass/pipeline", {
             "sourceId": feature_id,
             "relationType": 3,
             "testType": 1,
             "taskId": task_id,
-            "disableCache": "false",
+            "disableCache": "true",
         })
 
     def job_meta(self, job_id: int) -> Dict[str, Any]:
         return self.http.get_data(KDEV, "/api/kdev/pipeline/pipelineJobLog", {"id": job_id})
 
+    def job_log_download(self, job_id: int) -> str:
+        """优先使用全量日志下载接口。失败时抛 SkillError，由调用方降级分页接口。"""
+        resp = self.http.get_response(KDEV, "/api/kdev/pipeline/job/log/download", {"id": job_id})
+        content_type = (resp.headers.get("content-type") or "").lower()
+        text = resp.text or ""
+        looks_json = "application/json" in content_type or text.lstrip().startswith("{")
+        if looks_json:
+            try:
+                data = resp.json()
+            except Exception as exc:
+                raise SkillError("API_ERROR", f"job {job_id} 全量日志下载返回非法 JSON: {exc}", 1, "fallback_to_stream_log") from exc
+            if isinstance(data, dict):
+                status = data.get("status")
+                code = data.get("code")
+                if status not in (None, 0, 200) or code not in (None, 0, 200):
+                    raise SkillError("API_ERROR", f"job {job_id} 全量日志下载业务失败: {data}", 1, "fallback_to_stream_log")
+                payload = data.get("data")
+                if isinstance(payload, str):
+                    return payload
+            raise SkillError("API_ERROR", f"job {job_id} 全量日志下载未返回日志文本: {data}", 1, "fallback_to_stream_log")
+        return resp.content.decode(resp.encoding or "utf-8", errors="replace")
+
+    def job_log_stream(self, job_id: int, error: bool = False, max_pages: int = 200) -> str:
+        """分页读取日志流，直到 hasMore=false。
+
+        KDev 日志接口返回 {content, offset, hasMore}；老版本只取 start=0 会截断。
+        """
+        path = "/api/kdev/pipeline/pipelineJobLog/errorLog" if error else "/api/kdev/pipeline/pipelineJobLog/log"
+        start = 0
+        parts: List[str] = []
+        seen = set()
+        for _ in range(max_pages):
+            data = self.http.get_data(KDEV, path, {"id": job_id, "start": start}) or {}
+            content = data.get("content") or ""
+            if content:
+                parts.append(content)
+            has_more = bool(data.get("hasMore"))
+            next_offset = data.get("offset")
+            if not has_more:
+                break
+            try:
+                next_start = int(next_offset)
+            except (TypeError, ValueError):
+                next_start = start + len(content.encode("utf-8"))
+            if next_start in seen or next_start <= start:
+                raise SkillError("INCOMPLETE_KDEV_LOG", f"job {job_id} 日志分页 offset 未前进，拒绝输出截断日志", 1, "retry_or_use_download")
+            seen.add(next_start)
+            start = next_start
+        else:
+            raise SkillError("INCOMPLETE_KDEV_LOG", f"job {job_id} 日志超过 {max_pages} 页，拒绝输出可能截断的数据", 1, "retry_or_use_download")
+        return "".join(parts)
+
     def job_log(self, job_id: int, error: bool = False) -> str:
-        """优先 download 全量接口;失败时按 offset 读取全部增量日志。"""
         if not error:
             try:
-                raw = self.http.get_raw(KDEV, "/api/kdev/pipeline/job/log/download", {"id": job_id})
-                return raw.decode("utf-8", errors="replace")
+                return self.job_log_download(job_id)
             except SkillError:
-                pass  # 退化到增量流
-        path = "/api/kdev/pipeline/pipelineJobLog/errorLog" if error else "/api/kdev/pipeline/pipelineJobLog/log"
-        chunks = []
-        start = 0
-        while True:
-            try:
-                data = self.http.get_data(KDEV, path, {"id": job_id, "start": start}) or {}
-            except SkillError as exc:
-                if error:
-                    print(f"[warning] job {job_id} 错误日志获取失败: {exc.msg}", file=sys.stderr)
-                    return "".join(chunks)
-                raise
-            chunks.append(data.get("content") or "")
-            if not data.get("hasMore"):
-                return "".join(chunks)
-            try:
-                offset = int(data.get("offset"))
-            except (TypeError, ValueError) as exc:
-                raise SkillError("API_ERROR", f"job {job_id} 日志分页缺少有效 offset") from exc
-            if offset <= start:
-                raise SkillError("API_ERROR", f"job {job_id} 日志分页 offset 未前进")
-            start = offset
+                return self.job_log_stream(job_id, error=False)
+        return self.job_log_stream(job_id, error=True)
 
 
 def parse_feature_id(url: str) -> str:
@@ -412,6 +440,98 @@ def parse_feature_id(url: str) -> str:
     return fid
 
 
+def parse_task_id_from_url(url: str) -> Optional[int]:
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+    for key in ("taskId", "task_id", "testTaskId"):
+        val = q.get(key, [None])[0]
+        if val and str(val).isdigit():
+            return int(val)
+    return None
+
+
+def _walk_values(obj: Any):
+    if isinstance(obj, dict):
+        for value in obj.values():
+            yield value
+            yield from _walk_values(value)
+    elif isinstance(obj, list):
+        for item in obj:
+            yield item
+            yield from _walk_values(item)
+
+
+def related_task_summary(relation_teams: Optional[Dict[str, Any]]) -> List[str]:
+    if not relation_teams:
+        return []
+    rows: List[Dict[str, Any]] = []
+    for group in ("devBranchTeams", "featureTeams", "releaseTeams"):
+        for item in relation_teams.get(group) or []:
+            if isinstance(item, dict) and item.get("taskId"):
+                row = dict(item)
+                row["_group"] = group
+                rows.append(row)
+    rows.sort(key=lambda x: x.get("createTime") or 0, reverse=True)
+    return [str(x.get("taskId")) for x in rows]
+
+
+def infer_task_id(feature_detail: Dict[str, Any], feature_url: str, explicit_task_id: Optional[int],
+                  relation_teams: Optional[Dict[str, Any]] = None) -> int:
+    """解析本次 feature 对应的 Artemis 内部 Long taskId。
+
+    来源优先级: CLI 显式参数 > URL query > feature/detail 返回字段 > 关联任务列表中的数字 taskId。
+    KDev 关联 Team 任务号常为 T123...，不能直接传给 pass/pipeline；只作为提示。
+    """
+    if explicit_task_id:
+        return explicit_task_id
+    from_url = parse_task_id_from_url(feature_url)
+    if from_url:
+        return from_url
+    candidates: List[int] = []
+    for key in ("taskId", "testTaskId", "artemisTaskId", "qaTaskId", "passTaskId"):
+        val = feature_detail.get(key)
+        if isinstance(val, int):
+            candidates.append(val)
+        elif isinstance(val, str) and val.isdigit():
+            candidates.append(int(val))
+    for value in _walk_values(feature_detail):
+        if isinstance(value, dict):
+            for key in ("taskId", "testTaskId", "artemisTaskId", "qaTaskId", "passTaskId"):
+                val = value.get(key)
+                if isinstance(val, int):
+                    candidates.append(val)
+                elif isinstance(val, str) and val.isdigit():
+                    candidates.append(int(val))
+    if relation_teams:
+        for value in _walk_values(relation_teams):
+            if isinstance(value, dict):
+                val = value.get("taskId")
+                if isinstance(val, int):
+                    candidates.append(val)
+                elif isinstance(val, str) and val.isdigit():
+                    candidates.append(int(val))
+    unique = []
+    for val in candidates:
+        if val not in unique:
+            unique.append(val)
+    if len(unique) == 1:
+        return unique[0]
+    if len(unique) > 1:
+        raise SkillError(
+            "AMBIGUOUS_TASK_ID",
+            f"feature 详情中发现多个 taskId 候选 {unique}，无法判断本次应使用哪一个；请通过 --task-id 显式指定。",
+            2,
+            "ask_for_task_id",
+        )
+    related = related_task_summary(relation_teams)
+    hint = f"；已自动发现关联 Team 任务号: {', '.join(related)}，但它不是 pass/pipeline 需要的 Artemis 内部 Long taskId" if related else ""
+    raise SkillError(
+        "MISSING_TASK_ID",
+        "未能从 KDev feature 链接、feature 详情或关联任务列表解析到 Artemis 内部 Long taskId。禁止使用固定示例 taskId；请提供带 taskId 的链接或通过 --task-id 指定" + hint + "。",
+        2,
+        "ask_for_task_id",
+    )
+
+
 def safe_name(name: str) -> str:
     return re.sub(r"[\\/:*?\"<>|\s]+", "_", name or "job")
 
@@ -420,46 +540,27 @@ def kdev_cmd(args: argparse.Namespace, start_ms: int) -> None:
     if not args.feature_url:
         raise SkillError("MISSING_ARGUMENT", "缺少 --feature-url", 2, "ask_for_feature_url")
     fid = parse_feature_id(args.feature_url)
-    query = urllib.parse.parse_qs(urllib.parse.urlparse(args.feature_url).query)
-    try:
-        biz_id = int(query.get("bizId", ["84"])[0])
-    except (TypeError, ValueError) as exc:
-        raise SkillError("INVALID_URL", "KDev feature URL 中 bizId 无效", 2, "ask_for_valid_url") from exc
     out = ensure_out(args.out or f"tmp/kdev-feature-{fid}")
     logs_dir = out / "logs"
     logs_dir.mkdir(exist_ok=True)
     http = InternalClient()
     client = KDevClient(http)
-
-    # 1) feature 身份校验: 确认 fid 真实存在,并拿到 title(落盘时一并记录,防止拿错 feature)
-    feat = client.feature_detail(fid, biz_id=biz_id)
-    feat_title = (feat or {}).get("title") or ""
-    if not feat_title:
-        raise SkillError("FEATURE_NOT_FOUND", f"feature {fid} 不存在或无权访问", 2, "ask_for_valid_url")
-
-    # 2) 动态解析当前生效的测试任务 taskId(绝不写死)
-    task = client.task_latest(fid)
-    task_id = (task or {}).get("taskId")
-    if not task_id or not (task or {}).get("exist"):
-        raise SkillError("TASK_NOT_FOUND", f"feature {fid} 没有可用的测试任务(task/feature/latest 返回空)", 2, "ask_for_valid_url")
-    try:
-        task_id = int(task_id)
-    except (TypeError, ValueError) as exc:
-        raise SkillError("API_ERROR", f"feature {fid} 返回无效 taskId: {task_id}") from exc
-
-    # 3) 用动态 taskId 拉准出流水线(分支/commit/流水线日志)
+    feature_detail = client.feature_detail(fid)
+    relation_teams = client.relation_team_list(fid)
+    task_id = infer_task_id(feature_detail, args.feature_url, args.task_id, relation_teams)
     data = client.pass_pipeline(fid, task_id)
-    items = (data or {}).get("list") or []
+    items = data.get("list") or []
     if not items:
-        raise SkillError("API_ERROR", f"feature {fid} 没有准出流水线数据", 1, "report_no_pipeline")
+        raise SkillError("API_ERROR", f"feature {fid} / taskId {task_id} 没有准出流水线数据", 1, "report_no_pipeline")
     branch = items[0]
-
-    # 4) 检查分支字段完整性;归属仍需结合 feature 关联分支核对。
-    branch_name = branch.get("branch") or ""
-    commit_id = branch.get("commitId") or ""
-    if not branch_name:
-        raise SkillError("DATA_MISMATCH", "pass/pipeline 返回的 branch 为空,疑似数据异常", 1, "report_diagnostic")
-
+    expected_branch = args.expected_branch
+    if expected_branch and branch.get("branch") != expected_branch:
+        raise SkillError(
+            "KDEV_DATA_MISMATCH",
+            f"KDev 返回分支 {branch.get('branch')} 与期望分支 {expected_branch} 不一致，拒绝落盘；请确认 taskId 是否属于该 feature。",
+            1,
+            "provide_correct_task_id_or_branch",
+        )
     jobs = []
     for pipe in branch.get("pipelineList") or []:
         plog = pipe.get("pipelineLog") or {}
@@ -468,27 +569,23 @@ def kdev_cmd(args: argparse.Namespace, start_ms: int) -> None:
             name = job.get("name") or str(jid)
             meta = client.job_meta(jid)
             content = client.job_log(jid, error=False)
-            err = client.job_log(jid, error=True)
+            try:
+                err = client.job_log(jid, error=True)
+                err_error = None
+            except SkillError as exc:
+                err = ""
+                err_error = {"error": exc.error, "msg": exc.msg, "next_action": exc.next_action}
             log_file = logs_dir / f"{jid}_{safe_name(name)}.log"
             log_file.write_text(content, encoding="utf-8")
             err_file = None
             if err:
                 err_file = logs_dir / f"{jid}_{safe_name(name)}.error.log"
                 err_file.write_text(err, encoding="utf-8")
-            jobs.append({"jobLogId": jid, "name": name, "status": job.get("statusDesc") or job.get("status"), "meta": meta, "log": str(log_file), "errorLog": str(err_file) if err_file else None})
-    payload = {
-        "featureId": fid,
-        "featureTitle": feat_title,
-        "taskId": task_id,
-        "branch": branch,
-        "jobs": jobs,
-    }
+            jobs.append({"jobLogId": jid, "name": name, "status": job.get("statusDesc") or job.get("status"), "meta": meta, "log": str(log_file), "errorLog": str(err_file) if err_file else None, "errorLogFetchError": err_error})
+    payload = {"featureId": fid, "taskId": task_id, "featureDetail": feature_detail, "relationTeams": relation_teams, "branch": branch, "jobs": jobs}
     out_file = out / f"kdev_feature_{fid}.json"
     out_file.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
-    emit(True, 0, "KDev 日志已拉取", data={
-        "output": str(out_file), "jobCount": len(jobs), "logsDir": str(logs_dir),
-        "featureTitle": feat_title, "taskId": task_id, "branch": branch_name, "commitId": commit_id,
-    }, start_ms=start_ms)
+    emit(True, 0, "KDev 日志已拉取", data={"output": str(out_file), "jobCount": len(jobs), "logsDir": str(logs_dir)}, start_ms=start_ms)
 
 
 def git_clone_cmd(git_url: str, branch: Optional[str], dest: Path) -> Dict[str, Any]:
@@ -528,6 +625,11 @@ def check_cmd(args: argparse.Namespace, start_ms: int) -> None:
     """
     root = Path(args.data_root)
     problems: List[str] = []
+    ktest_branch = None
+    ktest_commit = None
+    kdev_branch = None
+    kdev_commit = None
+    acc_branch = None
 
     # 1) KTest 覆盖率 (coverage_<cid>.json)
     ktest = None
@@ -536,6 +638,9 @@ def check_cmd(args: argparse.Namespace, start_ms: int) -> None:
     if ktest and ktest.exists():
         try:
             d = json.loads(ktest.read_text(encoding="utf-8"))
+            report = d.get("report") or {}
+            ktest_branch = report.get("branch")
+            ktest_commit = report.get("commitId")
             agg = d.get("aggregate") or {}
             ok = d.get("report") and (agg.get("diff") is not None) and d.get("files")
             ktest_status = "完整 ✓" if ok else "不完整 ✗"
@@ -557,10 +662,29 @@ def check_cmd(args: argparse.Namespace, start_ms: int) -> None:
     if kdev and kdev.exists():
         logs = list((kdev / "logs").glob("*.log")) if (kdev / "logs").exists() else []
         meta = kdev / "feature.json"
+        if not meta.exists():
+            alt = kdev / f"kdev_feature_{args.feature_id}.json"
+            meta = alt if alt.exists() else meta
         ok = meta.exists() and len(logs) > 0 and all(f.stat().st_size > 0 for f in logs)
+        if ok:
+            try:
+                md = json.loads(meta.read_text(encoding="utf-8"))
+                if not md.get("taskId") or not md.get("featureDetail"):
+                    ok = False
+                    problems.append(f"KDev 元信息 {meta} 缺 taskId/featureDetail,无法证明流水线归属本 feature；请用新版 kdev 命令重新拉取")
+                b = md.get("branch") or {}
+                if "branch" in b and isinstance(b.get("branch"), str):
+                    kdev_branch = b.get("branch")
+                    kdev_commit = b.get("commitId")
+                elif isinstance(md.get("branch"), str):
+                    kdev_branch = md.get("branch")
+                    kdev_commit = md.get("commitId")
+            except Exception as e:
+                ok = False
+                problems.append(f"KDev 元信息 {meta} 无法解析: {e}")
         kdev_status = f"完整 ✓ ({len(logs)} 份日志)" if ok else "不完整 ✗"
         if not ok:
-            problems.append(f"KDev 日志 {kdev} 缺 feature.json 或 logs 为空/存在空日志")
+            problems.append(f"KDev 日志 {kdev} 缺 feature.json/kdev_feature_<id>.json 或 logs 为空/存在空日志")
     elif kdev and args.feature_id:
         kdev_status = "未获取 ✗ (缺 data/kdev/<featureId>/)"
         problems.append(f"未获取 KDev 日志: 运行 kdev --feature-url <URL> 或 kdev_fetch.py")
@@ -575,6 +699,7 @@ def check_cmd(args: argparse.Namespace, start_ms: int) -> None:
         try:
             d = json.loads(acc.read_text(encoding="utf-8"))
             tr = d.get("testReport") or {}
+            acc_branch = tr.get("branch")
             ok = tr.get("testMethodList") is not None and tr.get("branch")
             acc_status = "完整 ✓" if ok else "不完整 ✗"
             if not ok:
@@ -615,6 +740,16 @@ def check_cmd(args: argparse.Namespace, start_ms: int) -> None:
         else:
             code_status = "未获取 ✗ (目录不存在)"
             problems.append(f"未获取代码: {cd} 不存在,请先 clone")
+
+    if kdev_branch and ktest_branch and kdev_branch != ktest_branch:
+        problems.append(f"KDev 分支({kdev_branch}) 与 KTest 覆盖率分支({ktest_branch}) 不一致,拒绝分析")
+        kdev_status += "；分支不一致 ✗"
+    if acc_branch and ktest_branch and acc_branch != ktest_branch:
+        problems.append(f"精准测试报告分支({acc_branch}) 与 KTest 覆盖率分支({ktest_branch}) 不一致,拒绝分析")
+        acc_status += "；分支不一致 ✗"
+    if kdev_commit and ktest_commit and kdev_commit != ktest_commit:
+        problems.append(f"KDev commit({kdev_commit[:8]}) 与 KTest 覆盖率 commit({ktest_commit[:8]}) 不一致,拒绝分析")
+        kdev_status += "；commit 不一致 ✗"
 
     lines = [
         "# 四样数据完整性检查",
@@ -660,6 +795,8 @@ def main() -> int:
     p.add_argument("--out", default=None)
     p = sub.add_parser("kdev")
     p.add_argument("--feature-url", required=True)
+    p.add_argument("--task-id", type=int, help="KDev/精准测试任务 id；必须来自本次链接或用户输入，脚本不会使用固定示例值")
+    p.add_argument("--expected-branch", help="期望分支名；提供后会校验 KDev 返回分支，避免错拉其它 feature 的流水线")
     p.add_argument("--out", default=None)
     p = sub.add_parser("check")
     p.add_argument("--cid", type=int, help="KTest 报告 id")

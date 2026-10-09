@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# ///
 """覆盖率诊断分析 —— 把四样数据变成有依据的"该测未测"结论。
 
 输入(只读现成产物,不重新拉取):
@@ -24,13 +28,29 @@ import json
 import os
 import re
 import sys
+import time
+import traceback
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 WS = Path(os.environ.get("COVFETCH_WS") or os.getcwd())
 
 
 class AnalysisError(Exception):
     pass
+
+
+def emit(ok: bool, code: int, msg: str, *, error=None, data=None, next_action='done', start_ms=0):
+    payload = {
+        "ok": ok,
+        "code": code,
+        "error": error,
+        "msg": msg,
+        "data": data or {},
+        "next_action": next_action,
+        "duration_ms": int(time.time() * 1000) - start_ms,
+    }
+    print(json.dumps(payload, ensure_ascii=False))
 
 
 def load_json(path: Path) -> dict:
@@ -42,7 +62,7 @@ def load_json(path: Path) -> dict:
 
 # ---------- 依据收集 ----------
 
-def collect_method_evidence(acc: dict) -> list[dict]:
+def collect_method_evidence(acc: dict) -> List[dict]:
     """[A][C] 从精准测试报告收集每个变更方法的方法级依据。"""
     tr = acc.get("testReport") or {}
     methods = tr.get("testMethodList") or []
@@ -160,7 +180,7 @@ def pct(v, nd=0) -> str:
 
 # ---------- 测试样例生成(5) ----------
 
-def extract_method_source(code_dir: Path, jar_path: str, full_clazz: str, start_line: int | None = None) -> str | None:
+def extract_method_source(code_dir: Path, jar_path: str, full_clazz: str, start_line: Optional[int] = None) -> Optional[str]:
     """从代码目录按 jarPath 定位源文件,提取方法的源码实现(供测试样例参考)。
 
     jar_path 形如 com/x/y/Foo.java;在代码目录下按 basename + 路径后缀定位。
@@ -207,7 +227,7 @@ def extract_method_source(code_dir: Path, jar_path: str, full_clazz: str, start_
     return "\n".join(buf)
 
 
-def extract_injected_fields(code_dir: Path, jar_path: str) -> list[str]:
+def extract_injected_fields(code_dir: Path, jar_path: str) -> List[str]:
     """从源码提取依赖注入字段(有依据: 非 static 的成员变量),用于生成 @Mock/@InjectMocks。"""
     if not code_dir:
         return []
@@ -232,7 +252,7 @@ def extract_injected_fields(code_dir: Path, jar_path: str) -> list[str]:
     return fields
 
 
-def render_test_section(acc: dict, cov: dict, code_dir: str, missing_methods: list) -> list[str]:
+def render_test_section(acc: dict, cov: dict, code_dir: str, missing_methods: list) -> List[str]:
     """生成测试样例(只对该测未测方法)。全部基于签名+源码,不编造业务断言。"""
     L = []
     L.append("## 6. 测试样例生成(基于源码,需研发补充断言)")
@@ -327,7 +347,7 @@ def coverage_gap(coverage: dict, target_pct: float) -> dict:
     }
 
 
-def rank_methods_to_cover(coverage: dict, acc: dict, code_dir: str) -> list[dict]:
+def rank_methods_to_cover(coverage: dict, acc: dict, code_dir: str) -> List[dict]:
     """按"方法未覆盖变更行数"排序,推荐优先补测方法。
 
     依据: 每个变更文件的 diffMiss(diff 行里未覆盖数) + 精准测试报告的方法级数据。
@@ -357,7 +377,7 @@ def rank_methods_to_cover(coverage: dict, acc: dict, code_dir: str) -> list[dict
     return methods
 
 
-def render_gap_section(coverage: dict, acc: dict, code_dir: str, target_pct: float) -> list[str]:
+def render_gap_section(coverage: dict, acc: dict, code_dir: str, target_pct: float) -> List[str]:
     """渲染"达标路径"章节。"""
     L = []
     L.append("## 5. 达标路径(覆盖率缺口分析)")
@@ -430,7 +450,7 @@ def load_source_map(code_dir: Path, line_files: dict) -> dict:
     return src_map
 
 
-def simulate_removal(coverage: dict, suspected_lines: list[tuple]) -> dict:
+def simulate_removal(coverage: dict, suspected_lines: List[Tuple]) -> dict:
     """模拟"去掉疑似冗余的变更行"后的增量覆盖率。
 
     数学模型(行级):
@@ -478,7 +498,7 @@ def judge_missing(method: dict, range_miss: list) -> dict:
 
 # ---------- 报告渲染 ----------
 
-def render_report(acc: dict, cov: dict, code_dir: str | None, evidence, target_pct: float | None = None) -> str:
+def render_report(acc: dict, cov: dict, code_dir: Optional[str], evidence, target_pct: Optional[float] = None) -> str:
     methods, official = evidence  # (list, dict)
     line_files = collect_line_evidence(cov)
 
@@ -626,7 +646,7 @@ def render_report(acc: dict, cov: dict, code_dir: str | None, evidence, target_p
     return "\n".join(lines)
 
 
-def main():
+def main(start_ms: int):
     p = argparse.ArgumentParser(description="覆盖率诊断: 该测未测 + 冗余提示 + 达标路径(有依据)")
     p.add_argument("--task-id", type=int, required=True, help="精准测试 taskId")
     p.add_argument("--cid", type=int, required=True, help="KTest 增量覆盖率 cid")
@@ -665,7 +685,22 @@ def main():
     of.write_text(report, encoding="utf-8")
     print(report)
     print(f"\n[written] {of}")
+    emit(True, 0, "覆盖率诊断完成", data={"output": str(of), "taskId": a.task_id, "cid": a.cid}, start_ms=start_ms)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    start = int(time.time() * 1000)
+    try:
+        sys.exit(main(start))
+    except AnalysisError as e:
+        print(f"[error] ANALYSIS_ERROR: {e}", file=sys.stderr)
+        emit(False, 1, str(e), error="ANALYSIS_ERROR", next_action="fix_data_alignment_or_fetch_missing_data", start_ms=start)
+        sys.exit(1)
+    except KeyboardInterrupt:
+        emit(False, 130, "用户中断", error="INTERRUPTED", start_ms=start)
+        sys.exit(130)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        emit(False, 1, f"未预期错误: {e}", error="UNEXPECTED_ERROR", start_ms=start)
+        sys.exit(1)

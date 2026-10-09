@@ -1,4 +1,5 @@
 {
+  "schema_version": 2,
   "long_running": true,
   "confidence": "high",
   "evidence": [
@@ -10,5 +11,45 @@
   "a2a_chat_sync": false,
   "runner": "call_remote_agent",
   "method": "CALLBACK",
-  "needs_remote_guard": true
+  "needs_remote_guard": true,
+  "skill": {
+    "long_running": true,
+    "derived_from": [
+      "scripts/coverage_review.py"
+    ],
+    "prose_alert": false,
+    "prose_evidence": []
+  },
+  "scripts": {
+    "scripts/_ktest_session.py": {
+      "long_running": false,
+      "confidence": "low",
+      "evidence": [],
+      "runner": "exec",
+      "method": "CALLBACK"
+    },
+    "scripts/analyze.py": {
+      "long_running": false,
+      "confidence": "low",
+      "evidence": [],
+      "runner": "exec",
+      "method": "CALLBACK"
+    },
+    "scripts/coverage_review.py": {
+      "long_running": true,
+      "confidence": "high",
+      "evidence": [
+        "long_timeout"
+      ],
+      "runner": "call_remote_agent",
+      "method": "CALLBACK"
+    },
+    "scripts/fetch_accuracy.py": {
+      "long_running": false,
+      "confidence": "low",
+      "evidence": [],
+      "runner": "exec",
+      "method": "CALLBACK"
+    }
+  }
 }

@@ -30,7 +30,7 @@ description: 本技能用于核验和拉取 KTest 覆盖率报告、精准测试
 |---|---|---|
 | KTest 覆盖率(增量) | `coverage_review.py coverage --cid <增量cid>` | `coverage_<cid>.json` |
 | 精准测试报告 | `fetch_accuracy.py --task-id <taskId>` | `accuracy_report_<taskId>.json` |
-| KDev 日志 | `coverage_review.py kdev --feature-url <url>` | `kdev_feature_<id>.json` + `logs/` |
+| KDev 日志 | `coverage_review.py kdev --feature-url <url> [--task-id <taskId>] [--expected-branch <branch>]` | `kdev_feature_<id>.json` + `logs/` |
 | GitLab 代码 | 手动 clone 或 `kdev_fetch.py --with-code` | 代码目录 |
 
 **cid 增量/全量坑(实测重要)**：KTest 报告分 `type=1`(全量) 和 `type=2`(增量)。
@@ -49,7 +49,7 @@ description: 本技能用于核验和拉取 KTest 覆盖率报告、精准测试
 
 若遇到 `INCOMPLETE_COVERAGE_DATA` 错误，说明拉取有缺口，优先排查树遍历是否漏了节点、接口是否被截断。不要忽略错误继续分析。
 
-**防幻觉总闸**: 若某样数据因任何原因拉不到/不完整,不允许编造或猜测,直接向用户说明"未获取 xxx 信息",并给出补齐命令。可运行 `check` 统一检查四样数据:
+**防幻觉总闸**: 若某样数据因任何原因拉不到/不完整,不允许编造或猜测,直接向用户说明"未获取 xxx 信息",并给出补齐命令。KDev 流水线取数中的 `taskId` 必须来自本次用户输入、URL query、KDev feature 详情或 feature 关联任务列表动态解析；如果只发现 `T123...` Team 任务号而无法映射为 Artemis 内部 Long taskId,必须询问用户补充,禁止使用任何固定示例值兜底。可运行 `check` 统一检查四样数据:
 
 ```bash
 uv run <skill_directory>/scripts/coverage_review.py check \
@@ -103,14 +103,14 @@ uv run <skill_directory>/scripts/fetch_accuracy.py --from-log data/kdev/<feature
 4. 如目标是 KDev feature 日志，执行命令:
 
 ```bash
-uv run <skill_directory>/scripts/coverage_review.py kdev --feature-url '<kdev_feature_url>' --out tmp/kdev-feature-<id>
+uv run <skill_directory>/scripts/coverage_review.py kdev \
+  --feature-url '<kdev_feature_url>' \
+  --task-id <本次链接/feature详情对应的taskId> \
+  --expected-branch '<GitLab链接中的分支名>' \
+  --out tmp/kdev-feature-<id>
 ```
 
-   `kdev` 子命令内部自动完成三步，**taskId 无需用户提供且绝不写死**：
-   1. `kdev/feature/detail` 校验 feature 真实身份(取 title)，防止拿错 feature；
-   2. `artemis/task/feature/latest` 动态解析当前生效的 taskId(一个 feature 可能挂多个测试任务)；
-   3. 用动态 taskId 调 `pass/pipeline` 拉准出流水线，落盘时记录 featureTitle/taskId/branch/commitId。
-   产出 `kdev_feature_<id>.json` 同时包含 feature 身份与流水线数据，供后续交叉核对。
+   如果 KDev feature 链接、feature 详情或 feature 关联任务列表无法解析出 Artemis 内部 Long taskId,且用户也未提供,脚本会以 `MISSING_TASK_ID` 失败；此时必须向用户补充询问 taskId。注意: `T123...` Team 任务号不是 pass/pipeline 需要的 Long taskId,不得把它或历史示例 taskId 代入。
 
 5. 在进入分析前，必须执行四样数据完整性检查:
 

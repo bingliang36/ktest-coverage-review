@@ -4,6 +4,9 @@
   "API_ERROR": {"exit_code": 1, "action": "report_api_failure"},
   "GIT_AUTH_FAILED": {"exit_code": 2, "action": "ask_user_for_git_credential_or_skip_code"},
   "INVALID_URL": {"exit_code": 2, "action": "ask_user_for_valid_url"},
+  "MISSING_TASK_ID": {"exit_code": 2, "action": "ask_user_for_task_id"},
+  "AMBIGUOUS_TASK_ID": {"exit_code": 2, "action": "ask_user_for_task_id"},
+  "KDEV_DATA_MISMATCH": {"exit_code": 1, "action": "report_data_mismatch"},
   "OUTPUT_ERROR": {"exit_code": 1, "action": "report_output_failure"},
   "REMOTE_AGENT_REQUIRED": {"exit_code": 2, "action": "retry_with_call_remote_agent"},
   "UNEXPECTED_ERROR": {"exit_code": 1, "action": "report_diagnostic"}

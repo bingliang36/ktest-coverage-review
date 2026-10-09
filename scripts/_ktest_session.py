@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# ///
 """KTest 覆盖率取数层 —— 浏览器会话封装。
 
 KTest 走 SSO/OBO,git 走 PAT,两套认证互不通用。
@@ -15,22 +19,30 @@ import subprocess
 import sys
 
 WS = os.environ.get('COVFETCH_WS') or os.getcwd()
-# kbrowse.sh 定位: 优先按 skill 目录向上找 workspace(挂了 skills/agent-browser),
-# 其次按 COVFETCH_WS 环境变量,最后回退到 cwd 下的约定路径。
-def _find_kbrowse():
-    cands = [
-        os.environ.get('KBROWSE'),
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '..', '..', 'skills', 'agent-browser', 'scripts', 'kbrowse.sh'),
-        os.path.join(WS, 'skills', 'agent-browser', 'scripts', 'kbrowse.sh'),
-    ]
-    for c in cands:
-        # 用 bash 调用,不需要 x 执行位(仓库里 kbrowse.sh 是 644)
-        if c and os.path.isfile(c) and os.access(c, os.R_OK):
-            return os.path.abspath(c)
-    raise RuntimeError('找不到 kbrowse.sh,请设置 KBROWSE 或 COVFETCH_WS')
-
-KBROWSE = None
 BASE = 'https://ktest.corp.kuaishou.com'
+
+
+def find_kbrowse() -> str:
+    """定位 agent-browser 的 kbrowse.sh。
+
+    优先使用 KBROWSE 环境变量；否则在当前 workspace 的系统技能和用户技能目录中查找，
+    避免不同安装位置下写死路径导致启动失败。
+    """
+    env_path = os.environ.get('KBROWSE')
+    candidates = []
+    if env_path:
+        candidates.append(env_path)
+    candidates.extend([
+        os.path.join(WS, 'skills/agent-browser/scripts/kbrowse.sh'),
+        os.path.join(WS, 'user-skills/agent-browser/scripts/kbrowse.sh'),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../skills/agent-browser/scripts/kbrowse.sh'),
+    ])
+    for path in candidates:
+        if path and os.path.exists(path):
+            return os.path.abspath(path)
+    raise RuntimeError('未找到 kbrowse.sh；请设置 KBROWSE 环境变量，或安装 agent-browser skill')
+
+
 
 
 class KTestSession:
@@ -40,21 +52,21 @@ class KTestSession:
         self.anchor = anchor_url or f'{BASE}/web/cov/collection'
         self.sid = None
         self.verbose = verbose
+        self.kbrowse = None
 
     def _log(self, msg):
         if self.verbose:
             print(f'[ktest] {msg}', file=sys.stderr)
 
     def __enter__(self):
-        global KBROWSE
-        KBROWSE = _find_kbrowse()
+        self.kbrowse = find_kbrowse()
         self.sid = subprocess.run(
-            ['bash', KBROWSE, 'new-session'],
+            ['bash', self.kbrowse, 'new-session'],
             capture_output=True, text=True, check=True).stdout.strip()
         self._log(f'session={self.sid}')
         self._log(f'SSO 登录中: {self.anchor}')
         r = subprocess.run(
-            ['bash', KBROWSE, '--browser-session', self.sid, 'open', self.anchor],
+            ['bash', self.kbrowse, '--browser-session', self.sid, 'open', self.anchor],
             capture_output=True, text=True, timeout=300)
         if r.returncode != 0:
             raise RuntimeError(f'SSO/open 失败: {r.stderr[-400:]}')
@@ -63,14 +75,14 @@ class KTestSession:
 
     def __exit__(self, *exc):
         if self.sid:
-            subprocess.run(['bash', KBROWSE, '--browser-session', self.sid, 'close'],
+            subprocess.run(['bash', self.kbrowse, '--browser-session', self.sid, 'close'],
                            capture_output=True, timeout=120)
             self._log('浏览器已关闭')
         return False
 
     def _eval(self, js, timeout=180):
         r = subprocess.run(
-            ['bash', KBROWSE, '--browser-session', self.sid, 'eval', js],
+            ['bash', self.kbrowse, '--browser-session', self.sid, 'eval', js],
             capture_output=True, text=True, timeout=timeout)
         out = r.stdout.strip()
         if not out:

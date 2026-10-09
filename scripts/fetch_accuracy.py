@@ -1,4 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# dependencies = []
+# ///
 """精准测试报告取数 —— 从 taskId 拉取精准测试(电商 QA-Accuracy)方法级覆盖率报告。
 
 数据源: qa-itest.corp.kuaishou.com(快手 SSO/OBO 域,复用 KTestSession 浏览器会话)
@@ -30,6 +34,9 @@ import json
 import os
 import re
 import sys
+import time
+import traceback
+from typing import List, Optional
 
 # 复用仓库内的浏览器会话封装(同域 SSO,自包含,不依赖外部 tools/covfetch)
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -55,7 +62,29 @@ METHOD_KEYS = ['fullName', 'increCoverage', 'branchCoverage', 'linkCoverage',
                'changeRanges', 'affectedLink', 'coveredLink', 'unCoveredLink']
 
 
-def extract_task_id(log_text: str) -> int | None:
+class FetchAccuracyError(Exception):
+    def __init__(self, error: str, msg: str, code: int = 1, next_action: str = 'done'):
+        super().__init__(msg)
+        self.error = error
+        self.msg = msg
+        self.code = code
+        self.next_action = next_action
+
+
+def emit(ok: bool, code: int, msg: str, *, error=None, data=None, next_action='done', start_ms=0):
+    payload = {
+        'ok': ok,
+        'code': code,
+        'error': error,
+        'msg': msg,
+        'data': data or {},
+        'next_action': next_action,
+        'duration_ms': int(time.time() * 1000) - start_ms,
+    }
+    print(json.dumps(payload, ensure_ascii=False))
+
+
+def extract_task_id(log_text: str) -> Optional[int]:
     """从 KDev 精准测试 job 日志里提取 taskId。返回 None 表示未找到。"""
     # 实测: 触发API返回结果里的 viewUrl 带 taskId=939418
     for pat in (r'taskId=(\d+)', r'"taskId"\s*:\s*"?(\d+)"?'):
@@ -91,7 +120,7 @@ def fetch_report(session: KTestSession, task_id: int) -> dict:
     return data
 
 
-def validate_report(data: dict, task_id: int) -> list[str]:
+def validate_report(data: dict, task_id: int) -> List[str]:
     """完整性校验。返回错误列表;为空表示通过。"""
     errs = []
     for k in REQUIRED_TOP:
@@ -134,7 +163,7 @@ def build_payload(data: dict, task_id: int) -> dict:
     }
 
 
-def main():
+def main(start_ms: int):
     p = argparse.ArgumentParser(description='拉取精准测试方法级覆盖率报告')
     p.add_argument('--task-id', type=int, help='精准测试 taskId;省略则从 --from-log 提取')
     p.add_argument('--from-log', help='KDev 精准测试 job 日志文件,自动提取 taskId')
@@ -149,16 +178,14 @@ def main():
         try:
             txt = open(a.from_log, encoding='utf-8', errors='replace').read()
         except OSError as e:
-            print(f'[fetch_accuracy] 读取日志失败: {e}', file=sys.stderr)
-            sys.exit(2)
+            raise FetchAccuracyError('MISSING_ARGUMENT', f'读取日志失败: {e}', 2, 'ask_for_valid_log')
         task_id = extract_task_id(txt)
         if not task_id:
-            print(f'[fetch_accuracy] 在日志里未找到 taskId: {a.from_log} => 未获取精准测试报告', file=sys.stderr)
-            sys.exit(2)
+            raise FetchAccuracyError('MISSING_ARGUMENT', f'在日志里未找到 taskId: {a.from_log} => 未获取精准测试报告', 2, 'ask_for_task_id')
         if v:
             print(f'[fetch_accuracy] 从日志提取 taskId={task_id}', file=sys.stderr)
     if not task_id:
-        p.error('需要 --task-id,或 --from-log 提供含 taskId 的日志')
+        raise FetchAccuracyError('MISSING_ARGUMENT', '需要 --task-id,或 --from-log 提供含 taskId 的日志', 2, 'ask_for_task_id')
 
     if v:
         print(f'[fetch_accuracy] 打开 SSO 会话锚点 {ACCURACY_ANCHOR}', file=sys.stderr)
@@ -166,13 +193,11 @@ def main():
         try:
             data = fetch_report(s, task_id)
         except RuntimeError as e:
-            print(f'[fetch_accuracy] 精准测试报告拉取失败: {e} => 未获取 taskId={task_id} 的报告', file=sys.stderr)
-            sys.exit(1)
+            raise FetchAccuracyError('API_ERROR', f'精准测试报告拉取失败: {e} => 未获取 taskId={task_id} 的报告', 1, 'report_api_failure')
 
     errs = validate_report(data, task_id)
     if errs:
-        print(f'[fetch_accuracy] 报告不完整,拒绝落盘: {"; ".join(errs)}', file=sys.stderr)
-        sys.exit(1)
+        raise FetchAccuracyError('API_ERROR', f'报告不完整,拒绝落盘: {"; ".join(errs)}', 1, 'report_api_failure')
 
     payload = build_payload(data, task_id)
     if v:
@@ -180,14 +205,30 @@ def main():
 
     if a.print_only:
         print(json.dumps(payload, ensure_ascii=False, indent=1))
-        return
+        emit(True, 0, '精准测试报告已获取', data={'taskId': task_id, 'printOnly': True}, start_ms=start_ms)
+        return 0
 
     os.makedirs(a.outdir, exist_ok=True)
     out = os.path.join(a.outdir, f'accuracy_report_{task_id}.json')
     with open(out, 'w', encoding='utf-8') as f:
         json.dump(payload, f, ensure_ascii=False, indent=1)
     print(out)
+    emit(True, 0, '精准测试报告已获取', data={'output': out, 'taskId': task_id}, start_ms=start_ms)
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    start = int(time.time() * 1000)
+    try:
+        sys.exit(main(start))
+    except FetchAccuracyError as e:
+        print(f'[error] {e.error}: {e.msg}', file=sys.stderr)
+        emit(False, e.code, e.msg, error=e.error, next_action=e.next_action, start_ms=start)
+        sys.exit(e.code)
+    except KeyboardInterrupt:
+        emit(False, 130, '用户中断', error='INTERRUPTED', start_ms=start)
+        sys.exit(130)
+    except Exception as e:
+        traceback.print_exc(file=sys.stderr)
+        emit(False, 1, f'未预期错误: {e}', error='UNEXPECTED_ERROR', start_ms=start)
+        sys.exit(1)
