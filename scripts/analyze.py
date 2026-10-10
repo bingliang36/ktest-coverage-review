@@ -107,7 +107,11 @@ def collect_method_evidence(acc: dict) -> List[dict]:
 
 
 def collect_line_evidence(cov: dict) -> dict:
-    """[B] 从 KTest 覆盖率收集文件级行证据。"""
+    """[B] 从 KTest 覆盖率收集文件级行证据。
+
+    fileContent 是 KTest 报告内嵌的完整源码(getCoverageMethodDetail 返回),
+    有了它,源码展示/行号核对/@Mock 提取不再依赖 GitLab 代码目录。
+    """
     files = {}
     for f in cov.get("files") or []:
         fp = f.get("filePath") or f.get("fileName") or f.get("className")
@@ -118,6 +122,8 @@ def collect_line_evidence(cov: dict) -> dict:
             "stats": f.get("stats"),
             # lineList 按行号索引,便于按 changeRanges 查
             "lines": {ln.get("line"): ln for ln in (f.get("lineList") or [])},
+            # 内嵌源码按行号索引(1-based);无 fileContent 时为空,由 code_dir 兜底
+            "content_lines": (f.get("fileContent") or "").split("\n") if f.get("fileContent") else [],
         }
     return files
 
@@ -160,11 +166,14 @@ def range_miss_lines(finfo: dict, ranges: list) -> list:
         else:
             merged.append([s, e])
     miss = []
+    content = finfo.get("content_lines") or []
     for ln, cell in finfo["lines"].items():
         if cell.get("diff") != 1 or cell.get("covered") != 1:
             continue
         if any(s <= ln <= e for s, e in merged):
-            miss.append({"line": ln, "covered": cell.get("covered"), "code": ""})
+            # 源码内容: 覆盖率 JSON 内嵌 fileContent 按 1-based 行号取
+            code = content[ln - 1] if 0 < ln <= len(content) else ""
+            miss.append({"line": ln, "covered": cell.get("covered"), "code": code.strip()[:120]})
     miss.sort(key=lambda x: x["line"])
     return miss
 
@@ -180,27 +189,49 @@ def pct(v, nd=0) -> str:
 
 # ---------- 测试样例生成(5) ----------
 
-def extract_method_source(code_dir: Path, jar_path: str, full_clazz: str, start_line: Optional[int] = None) -> Optional[str]:
-    """从代码目录按 jarPath 定位源文件,提取方法的源码实现(供测试样例参考)。
+def _find_file_source(code_dir: Optional[Path], jar_path: str, line_files: Optional[dict] = None) -> Optional[List[str]]:
+    """定位源文件行列表。优先级: 覆盖率 JSON 内嵌 fileContent > 代码目录。
 
-    jar_path 形如 com/x/y/Foo.java;在代码目录下按 basename + 路径后缀定位。
+    返回按行拆分的源码(不含换行符),找不到返回 None。
+    """
+    # 1) 覆盖率 JSON 内嵌 fileContent(无需 GitLab)
+    if line_files:
+        jp = jar_path or ""
+        base = jp.split("/")[-1] if jp else None
+        for k, v in line_files.items():
+            if base and (k == jp or (k or "").endswith("/" + jp) or (k or "").endswith(base)):
+                if v.get("content_lines"):
+                    return v["content_lines"]
+        # 兜底: 按 className 简名
+        cn = base.replace(".java", "") if base else None
+        for k, v in line_files.items():
+            if cn and (v.get("className") == cn or (k or "").endswith("/" + cn + ".java")):
+                if v.get("content_lines"):
+                    return v["content_lines"]
+    # 2) 代码目录兜底
+    if code_dir and jar_path:
+        base = jar_path.split("/")[-1]
+        for p in Path(code_dir).rglob("*.java"):
+            if p.name == base and (str(p).endswith(jar_path) or base == p.name):
+                try:
+                    return p.read_text(encoding="utf-8").split("\n")
+                except Exception:
+                    return None
+    return None
+
+
+def extract_method_source(code_dir: Optional[Path], jar_path: str, full_clazz: str,
+                          start_line: Optional[int] = None,
+                          line_files: Optional[dict] = None) -> Optional[str]:
+    """提取方法的源码实现(供测试样例参考)。
+
+    源码来源优先级: 覆盖率 JSON 内嵌 fileContent > 代码目录。
     优先用 changeRanges 的 startLine 定位方法体起点(平台给的行号,权威);
     无 startLine 时退化为方法名匹配(可能不准,标注)。
     返回方法体文本(从 startLine 到方法闭合),找不到返回 None(诚实,不编造)。
     """
-    if not code_dir:
-        return None
-    base = jar_path.split("/")[-1]
-    target = None
-    for p in Path(code_dir).rglob("*.java"):
-        if p.name == base and (str(p).endswith(jar_path) or base == p.name):
-            target = p
-            break
-    if target is None:
-        return None
-    try:
-        src = target.read_text(encoding="utf-8").split("\n")
-    except Exception:
+    src = _find_file_source(code_dir, jar_path, line_files)
+    if not src:
         return None
     i0 = None
     if start_line:
@@ -227,33 +258,29 @@ def extract_method_source(code_dir: Path, jar_path: str, full_clazz: str, start_
     return "\n".join(buf)
 
 
-def extract_injected_fields(code_dir: Path, jar_path: str) -> List[str]:
-    """从源码提取依赖注入字段(有依据: 非 static 的成员变量),用于生成 @Mock/@InjectMocks。"""
-    if not code_dir:
-        return []
-    base = jar_path.split("/")[-1]
-    target = None
-    for p in Path(code_dir).rglob("*.java"):
-        if p.name == base:
-            target = p
-            break
-    if target is None:
+def extract_injected_fields(code_dir: Optional[Path], jar_path: str, line_files: Optional[dict] = None) -> List[str]:
+    """从源码提取依赖注入字段(有依据: 非 static 的成员变量),用于生成 @Mock/@InjectMocks。
+
+    源码来源优先级: 覆盖率 JSON 内嵌 fileContent > 代码目录。
+    """
+    src = _find_file_source(code_dir, jar_path, line_files)
+    if not src:
         return []
     fields = []
-    try:
-        for line in target.read_text(encoding="utf-8").split("\n"):
-            s = line.strip()
-            # 非 static 的成员变量: private Xxx name; 或 private Xxx name = ...
-            m = re.match(r"private\s+(?:final\s+)?([A-Za-z_][\w<>\[\],\s]*?)\s+(\w+)\s*[;=]", s)
-            if m and "static" not in s:
-                fields.append(f"{m.group(1)} {m.group(2)}")
-    except Exception:
-        return []
+    for line in src:
+        s = line.strip()
+        # 非 static 的成员变量: private Xxx name; 或 private Xxx name = ...
+        m = re.match(r"private\s+(?:final\s+)?([A-Za-z_][\w<>\[\],\s]*?)\s+(\w+)\s*[;=]", s)
+        if m and "static" not in s:
+            fields.append(f"{m.group(1)} {m.group(2)}")
     return fields
 
 
-def render_test_section(acc: dict, cov: dict, code_dir: str, missing_methods: list) -> List[str]:
-    """生成测试样例(只对该测未测方法)。全部基于签名+源码,不编造业务断言。"""
+def render_test_section(acc: dict, cov: dict, code_dir: str, missing_methods: list, line_files: Optional[dict] = None) -> List[str]:
+    """生成测试样例(只对该测未测方法)。全部基于签名+源码,不编造业务断言。
+
+    源码来源: 覆盖率 JSON 内嵌 fileContent(优先) 或代码目录(可选)。
+    """
     L = []
     L.append("## 6. 测试样例生成(基于源码,需研发补充断言)")
     L.append("")
@@ -277,11 +304,11 @@ def render_test_section(acc: dict, cov: dict, code_dir: str, missing_methods: li
         L.append("")
         cr = (m.get("changeRanges") or [])
         start_line = cr[0].get("startLine") if cr else None
-        src = extract_method_source(Path(code_dir), jar, m.get("fullClazzName") or "", start_line) if code_dir else None
-        if src is None and code_dir:
-            L.append("> ⚠️ 未在代码目录定位到该方法源码(`jarPath` 可能不含模块前缀),测试样例仅基于签名,断言需研发补充。")
+        src = extract_method_source(Path(code_dir) if code_dir else None, jar, m.get("fullClazzName") or "", start_line, line_files)
+        if src is None:
+            L.append("> ⚠️ 未定位到该方法源码(覆盖率报告未内嵌该文件,且未提供代码目录),测试样例仅基于签名,断言需研发补充。")
             L.append("")
-        fields = extract_injected_fields(Path(code_dir), jar) if code_dir else []
+        fields = extract_injected_fields(Path(code_dir) if code_dir else None, jar, line_files)
         L.append("```java")
         L.append(f"// 测试类: {clz.split('.')[-1]}Test")
         L.append(f"// 被测方法: {meth}")
@@ -416,37 +443,44 @@ def render_gap_section(coverage: dict, acc: dict, code_dir: str, target_pct: flo
     L.append("")
     return L
 
-def load_source_map(code_dir: Path, line_files: dict) -> dict:
+def load_source_map(code_dir: Optional[Path], line_files: dict) -> dict:
     """按 (filePath, line) 构建源码行映射,供报告中展示变更未覆盖行的代码内容。
 
+    优先级: 覆盖率 JSON 内嵌 fileContent(无需 GitLab) > 代码目录(可选兜底)。
     只加载变更涉及的源文件(效率 + 避免全库)。
     filePath 形如 com/x/y/Foo.java,在 code_dir 下按相对路径定位(带 java 源码根)。
     """
     src_map = {}
-    # 收集需要定位的 filePath
-    targets = {fp for fp in line_files.keys() if fp}
-    # 建立 code_dir 下所有 .java 的 basename -> 绝对路径 索引(避免深路径猜错)
-    by_base = {}
-    for p in code_dir.rglob("*.java"):
-        by_base.setdefault(p.name, []).append(p)
-    for fp in targets:
-        base = fp.split("/")[-1]
-        # 优先完整相对路径匹配(含模块前缀),否则按文件名兜底
-        cand = None
-        for p in by_base.get(base, []):
-            if str(p).endswith(fp):
-                cand = p
-                break
-        if cand is None and by_base.get(base):
-            cand = by_base[base][0]
-        if cand is None:
+    # 1) 内嵌 fileContent: 与 line_files 的 key 直接对齐
+    for fp, v in line_files.items():
+        content = v.get("content_lines") or []
+        if not content:
             continue
-        try:
-            lines = cand.read_text(encoding="utf-8").split("\n")
-        except Exception:
-            continue
-        for i, ln in enumerate(lines, 1):
+        for i, ln in enumerate(content, 1):
             src_map[(fp, i)] = ln
+    # 2) 收集仍缺源的 filePath,从代码目录兜底
+    missing = {fp for fp in line_files.keys() if fp and not any((fp, i) in src_map for i in range(1, 3))}
+    if code_dir and missing:
+        by_base = {}
+        for p in Path(code_dir).rglob("*.java"):
+            by_base.setdefault(p.name, []).append(p)
+        for fp in missing:
+            base = fp.split("/")[-1]
+            cand = None
+            for p in by_base.get(base, []):
+                if str(p).endswith(fp):
+                    cand = p
+                    break
+            if cand is None and by_base.get(base):
+                cand = by_base[base][0]
+            if cand is None:
+                continue
+            try:
+                lines_ = cand.read_text(encoding="utf-8").split("\n")
+            except Exception:
+                continue
+            for i, ln in enumerate(lines_, 1):
+                src_map[(fp, i)] = ln
     return src_map
 
 
@@ -507,7 +541,7 @@ def render_report(acc: dict, cov: dict, code_dir: Optional[str], evidence, targe
     lines.append("")
     lines.append(f"- 精准测试报告: taskId={acc.get('taskId')}")
     lines.append(f"- KTest 覆盖率: cid={cov.get('cid')}")
-    lines.append(f"- 代码目录: {code_dir or '未提供(无法做行号核对)'}")
+    lines.append(f"- 代码目录: {code_dir or '未提供(源码用覆盖率报告内嵌 fileContent)'}")
     lines.append("")
 
     # 1. 官方结论
@@ -559,18 +593,23 @@ def render_report(acc: dict, cov: dict, code_dir: Optional[str], evidence, targe
         lines.append("- 平台未提供\"免测/豁免\"方法列表(unTestMethodList/ignoreMethodList 为空),因此本报告**不判定冗余代码**——那是平台才能给的口径,无依据不臆断。")
     else:
         lines.append(f"- 平台提供免测方法 {official['unTestMethodCount']} 个、豁免 {official['ignoreMethodCount']} 个,见上表。")
-    if not code_dir:
-        lines.append("- 未提供代码目录,无法核对 changeRanges 与源码行号的一致性,亦无法做调用关系/牵连方法分析。")
+    if code_dir:
+        lines.append(f"- 代码目录: {code_dir}(用于覆盖率报告未内嵌的文件与跨文件上下文)。")
+    elif any(v.get("content_lines") for v in line_files.values()):
+        lines.append("- 源码来自 KTest 覆盖率报告内嵌 fileContent;报告外的变更文件无源码,如需跨文件上下文请提供代码目录。")
+    else:
+        lines.append("- 报告未内嵌源码且未提供代码目录,无法核对 changeRanges 与源码行号的一致性。")
     lines.append("")
 
     # ---- 4. 冗余/低效代码识别(有依据,纯提示) ----
     lines.append("## 4. 疑似冗余/低效代码(提示,需研发确认)")
     lines.append("")
-    if not code_dir:
-        lines.append("- 未提供代码目录,无法展示变更未覆盖行的源码内容。")
+    # 源码行映射: 优先用覆盖率 JSON 内嵌 fileContent,代码目录兜底
+    src_map = load_source_map(Path(code_dir) if code_dir else None, line_files)
+    if not src_map:
+        lines.append("- 无法获取源码行映射,不能展示变更未覆盖行的源码内容。")
         lines.append("")
     else:
-        src_map = load_source_map(Path(code_dir), line_files)
         # 4.1: 变更未覆盖行(covered==1 且 diff==1) + 源码内容
         lines.append("### 4.1 变更未覆盖行(covered==1 ∩ diff==1)")
         lines.append("")
@@ -578,9 +617,10 @@ def render_report(acc: dict, cov: dict, code_dir: Optional[str], evidence, targe
         lines.append("")
         all_miss = []
         for f in cov.get("files") or []:
+            fkey = f.get("filePath") or f.get("fileName") or f.get("className")
             for x in f.get("lineList") or []:
                 if x.get("diff") == 1 and x.get("covered") == 1:
-                    code = src_map.get((f.get("filePath"), x.get("line")), "")
+                    code = src_map.get((fkey, x.get("line")), "")
                     all_miss.append({
                         "file": f.get("className"),
                         "line": x.get("line"),
@@ -603,9 +643,10 @@ def render_report(acc: dict, cov: dict, code_dir: Optional[str], evidence, targe
         lines.append("")
         all_part = []
         for f in cov.get("files") or []:
+            fkey = f.get("filePath") or f.get("fileName") or f.get("className")
             for x in f.get("lineList") or []:
                 if x.get("diff") == 1 and x.get("covered") == 3:
-                    code = src_map.get((f.get("filePath"), x.get("line")), "")
+                    code = src_map.get((fkey, x.get("line")), "")
                     all_part.append({
                         "file": f.get("className"),
                         "line": x.get("line"),
@@ -641,7 +682,7 @@ def render_report(acc: dict, cov: dict, code_dir: Optional[str], evidence, targe
     lines.extend(render_gap_section(cov, acc, code_dir, target_pct))
 
     # ---- 6. 测试样例生成 ----
-    lines.extend(render_test_section(acc, cov, code_dir, missing_methods))
+    lines.extend(render_test_section(acc, cov, code_dir, missing_methods, line_files))
 
     return "\n".join(lines)
 

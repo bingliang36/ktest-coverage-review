@@ -1,22 +1,22 @@
 ---
 name: ktest-coverage-review
-description: 本技能用于核验和拉取 KTest 覆盖率报告、精准测试报告、KDev 流水线日志与 GitLab 代码，并基于这些证据进行覆盖率诊断、达标路径分析和测试样例生成。当用户提供任意项目的 KTest 覆盖率链接/cid、精准测试 taskId/链接、KDev feature 链接或 GitLab 分支/仓库地址，要求验证数据完整性、分析覆盖率、定位未覆盖代码或生成测试建议时使用。不触发于通用代码审查、KAT 用例明细分析、线上故障排查或批量处理多个报告。
+description: 本技能用于核验和拉取 KTest 覆盖率报告与精准测试报告（KDev 流水线日志可选引导、GitLab 代码可选增强），并基于这些证据进行覆盖率诊断、达标路径分析和测试样例生成。当用户提供任意项目的 KTest 覆盖率链接/cid、精准测试 taskId/链接、KDev feature 链接或 GitLab 分支/仓库地址，要求验证数据完整性、分析覆盖率、定位未覆盖代码或生成测试建议时使用。不触发于通用代码审查、KAT 用例明细分析、线上故障排查或批量处理多个报告。
 ---
 
 # KTest 覆盖率核验
 
-本技能把四类只读数据整理成可核查证据:
+本技能把只读数据整理成可核查证据,按必要性分级:
 
-- KTest 覆盖率报告: 报告元信息、树形下钻、源码与行级覆盖状态。
-- 精准测试报告: 方法级增量覆盖率、影响链路、变更范围(changeRanges)。
-- KDev feature 流水线: 准出流水线 job 清单、全量日志与错误日志。
-- GitLab 代码: 分支代码、commit 对齐与文件清单。
+- **KTest 覆盖率报告(必需)**: 报告元信息、树形下钻、内嵌源码(fileContent)与行级覆盖状态。
+- **精准测试报告(必需)**: 方法级增量覆盖率、影响链路、变更范围(changeRanges)。
+- KDev feature 流水线(可选引导): 准出流水线 job 清单与日志,主要用于从 feature 链接反查精准测试 taskId;用户直接给 taskId 时可跳过。
+- GitLab 代码(可选增强): 仅用于覆盖率报告未内嵌的文件与跨文件上下文;KTest 报告自带 fileContent,默认流程不需要 clone 代码。
 
-不支持批量处理。一次只处理一个项目的一组数据：一个增量 cid、一个 taskId、一个 KDev feature 链接和一个代码目录。命令中的项目 ID、分支、仓库、cid、taskId 都必须来自用户输入或已成功拉取的数据，不得写死示例项目值。
+不支持批量处理。一次只处理一个项目的一组数据：一个增量 cid、一个 taskId、一个 KDev feature 链接(可选)和一个代码目录(可选)。命令中的项目 ID、分支、仓库、cid、taskId 都必须来自用户输入或已成功拉取的数据，不得写死示例项目值。
 
 ## 分析原则与能力
 
-分析层只消费已通过完整性检查的四样数据，不重新猜测或补造数据。每个结论必须能回溯到报告字段、源码行或明确的计算公式；无法从现有数据确认的内容直接标记“无法判断”，不输出确定性结论。
+分析层只消费已通过完整性检查的数据，不重新猜测或补造数据。每个结论必须能回溯到报告字段、源码行或明确的计算公式；无法从现有数据确认的内容直接标记“无法判断”，不输出确定性结论。
 
 - **官方结论**：原样展示 KTest/精准测试平台的 pass、风险和阈值，不用自定义结论覆盖官方口径。
 - **该测未测**：依据精准测试方法级增量覆盖率，以及 KTest `diff==1 && covered==1` 的变更行交集定位。
@@ -24,14 +24,14 @@ description: 本技能用于核验和拉取 KTest 覆盖率报告、精准测试
 - **达标路径**：按 KTest 增量行覆盖率公式计算目标缺口，按未覆盖变更行数排序推荐补测方法；支持自定义目标覆盖率。
 - **测试样例**：只针对诊断出的未覆盖方法生成基于真实签名、依赖字段和源码的 JUnit 骨架；业务断言必须由研发补充。
 
-## 四样数据与对应命令
+## 数据分级与对应命令
 
-| 数据 | 命令 | 产物 |
-|---|---|---|
-| KTest 覆盖率(增量) | `coverage_review.py coverage --cid <增量cid>` | `coverage_<cid>.json` |
-| 精准测试报告 | `fetch_accuracy.py --task-id <taskId>` | `accuracy_report_<taskId>.json` |
-| KDev 日志 | `coverage_review.py kdev --feature-url <url> [--task-id <taskId>] [--expected-branch <branch>]` | `kdev_feature_<id>.json` + `logs/` |
-| GitLab 代码 | 手动 clone 或 `kdev_fetch.py --with-code` | 代码目录 |
+| 数据 | 级别 | 命令 | 产物 |
+|---|---|---|---|
+| KTest 覆盖率(增量) | 必需 | `coverage_review.py coverage --cid <增量cid>` | `coverage_<cid>.json`(含 fileContent 内嵌源码) |
+| 精准测试报告 | 必需 | `fetch_accuracy.py --task-id <taskId>` | `accuracy_report_<taskId>.json` |
+| KDev 日志 | 可选引导 | `coverage_review.py kdev --feature-url <url> [--task-id <taskId>] [--expected-branch <branch>]` | `kdev_feature_<id>.json` + `logs/`(日志内含精准测试 taskId) |
+| GitLab 代码 | 可选增强 | 手动 clone(需 GITLAB_TOKEN) | 代码目录(仅补报告外文件) |
 
 **cid 增量/全量坑(实测重要)**：KTest 报告分 `type=1`(全量) 和 `type=2`(增量)。
 - 覆盖率分析**只用增量报告**(`type=2`,如 cid=9735795),对应精准测试报告的变更方法。
@@ -49,12 +49,12 @@ description: 本技能用于核验和拉取 KTest 覆盖率报告、精准测试
 
 若遇到 `INCOMPLETE_COVERAGE_DATA` 错误，说明拉取有缺口，优先排查树遍历是否漏了节点、接口是否被截断。不要忽略错误继续分析。
 
-**防幻觉总闸**: 若某样数据因任何原因拉不到/不完整,不允许编造或猜测,直接向用户说明"未获取 xxx 信息",并给出补齐命令。KDev 流水线取数中的 `taskId` 必须来自本次用户输入、URL query、KDev feature 详情或 feature 关联任务列表动态解析；如果只发现 `T123...` Team 任务号而无法映射为 Artemis 内部 Long taskId,必须询问用户补充,禁止使用任何固定示例值兜底。可运行 `check` 统一检查四样数据:
+**防幻觉总闸**: 若某样数据因任何原因拉不到/不完整,不允许编造或猜测,直接向用户说明"未获取 xxx 信息",并给出补齐命令。KDev 流水线取数中的 `taskId` 必须来自本次用户输入、URL query、KDev feature 详情、feature 关联任务列表或 artemis/task/feature/latest 接口动态解析；如果只发现 `T123...` Team 任务号而无法映射为 Artemis 内部 Long taskId,必须询问用户补充,禁止使用任何固定示例值兜底。可运行 `check` 统一检查(必需: KTest 覆盖率 + 精准测试;可选: KDev 日志、代码):
 
 ```bash
 uv run <skill_directory>/scripts/coverage_review.py check \
   --cid <增量cid> --feature-id <featureId> --task-id <taskId> \
-  --code-dir <代码目录> --data-root data
+  [--code-dir <代码目录>] --data-root data
 ```
 
 <!-- skill-creator: askuser-with-text-fallback-v1 -->
@@ -105,29 +105,28 @@ uv run <skill_directory>/scripts/fetch_accuracy.py --from-log data/kdev/<feature
 ```bash
 uv run <skill_directory>/scripts/coverage_review.py kdev \
   --feature-url '<kdev_feature_url>' \
-  --task-id <本次链接/feature详情对应的taskId> \
-  --expected-branch '<GitLab链接中的分支名>' \
+  [--task-id <本次链接/feature详情对应的taskId>] \
+  [--expected-branch '<GitLab链接中的分支名>'] \
   --out tmp/kdev-feature-<id>
 ```
 
-   如果 KDev feature 链接、feature 详情或 feature 关联任务列表无法解析出 Artemis 内部 Long taskId,且用户也未提供,脚本会以 `MISSING_TASK_ID` 失败；此时必须向用户补充询问 taskId。注意: `T123...` Team 任务号不是 pass/pipeline 需要的 Long taskId,不得把它或历史示例 taskId 代入。
+   若链接、feature 详情或关联任务列表均无法解析出 Artemis 内部 Long taskId,脚本会以 `MISSING_TASK_ID` 失败；此时向用户补充询问 taskId。注意: `T123...` Team 任务号不是 pass/pipeline 需要的 Long taskId,不得把它或历史示例 taskId 代入。
 
-5. 在进入分析前，必须执行四样数据完整性检查:
+5. 在进入分析前，执行数据完整性检查(必需: KTest 覆盖率 + 精准测试报告):
 
 ```bash
 uv run <skill_directory>/scripts/coverage_review.py check \
   --cid <增量cid> --feature-id <featureId> --task-id <taskId> \
-  --code-dir <代码目录> --data-root <data目录>
+  [--code-dir <代码目录>] --data-root <data目录>
 ```
 
-   只有 check 返回“四样数据齐全且完整”后，才允许进入分析；任何一项未获取或不完整，都必须直接告知用户缺少哪项。
+   只有 check 返回“必需数据齐全且完整”后，才允许进入分析；必需项任何一项未获取或不完整，都必须直接告知用户缺少哪项。KDev 日志与代码为可选,缺失不阻断。
 
-6. 完整性检查通过后，执行覆盖率诊断:
+6. 完整性检查通过后，执行覆盖率诊断(源码展示优先用 KTest 报告内嵌 fileContent,无需代码目录):
 
 ```bash
 uv run <skill_directory>/scripts/analyze.py \
-  --task-id <taskId> --cid <增量cid> \
-  --data-root <data目录> --code-dir <代码目录>
+  --task-id <taskId> --cid <增量cid> --data-root <data目录>
 ```
 
    如需评估自定义目标覆盖率:
@@ -135,8 +134,10 @@ uv run <skill_directory>/scripts/analyze.py \
 ```bash
 uv run <skill_directory>/scripts/analyze.py \
   --task-id <taskId> --cid <增量cid> \
-  --data-root <data目录> --code-dir <代码目录> --target <百分比>
+  --data-root <data目录> --target <百分比>
 ```
+
+   可选提供 `--code-dir <代码目录>` 增补覆盖率报告未内嵌的文件与跨文件上下文。
 
    分析报告包括：官方结论、该测未测方法、变更未覆盖行、部分覆盖行、疑似冗余提示、达标路径和测试样例骨架。
 
@@ -158,7 +159,7 @@ uv run <skill_directory>/scripts/coverage_review.py verify --cid <cid> --out tmp
 - `kdev_feature_<id>.json`: KDev feature 与流水线元信息。
 - `logs/`: KDev 各 job 全量日志和错误日志。
 - `analysis_<taskId>_<cid>.md`: 覆盖率诊断报告(含该测未测/疑似冗余/达标路径/测试样例)。
-- `data_check_*.md`: 四样数据完整性检查报告。
+- `data_check_*.md`: 数据完整性检查报告。
 
 ## 通用性
 

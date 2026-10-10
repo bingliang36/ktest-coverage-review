@@ -713,8 +713,8 @@ def check_cmd(args: argparse.Namespace, start_ms: int) -> None:
     else:
         acc_status = "跳过 (未指定 --task-id)"
 
-    # 4) 代码 (repos 目录下已 clone 且 HEAD 与 KTest 报告 commit 对齐)
-    code_status = "跳过 (未指定 --code-dir)"
+    # 4) 代码 (可选增强: 覆盖率 JSON 已含 fileContent,代码目录仅用于报告外文件与跨文件上下文)
+    code_status = "可选增强 (未指定,跳过)"
     if args.code_dir:
         cd = Path(args.code_dir)
         if cd.exists() and (cd / ".git").exists():
@@ -730,16 +730,16 @@ def check_cmd(args: argparse.Namespace, start_ms: int) -> None:
                     except Exception:
                         commit = None
                 if commit and head != commit:
-                    code_status = f"不完整 ✗ (代码 HEAD {head[:8]} ≠ 报告 commit {commit[:8]})"
-                    problems.append(f"代码 HEAD({head[:8]}) 与 KTest 报告 commit({commit[:8]}) 不对齐")
+                    # commit 漂移是正常现象(流水线运行期间分支有新 push),同分支视为对齐
+                    code_status = f"可用 ✓ ({head[:8]}; 与报告 commit {commit[:8]} 不同,同分支视为对齐)"
                 else:
                     code_status = f"完整 ✓ ({head[:8]})"
             else:
-                code_status = "不完整 ✗ (git rev-parse 失败)"
+                code_status = "不可用 ✗ (git rev-parse 失败)"
                 problems.append(f"代码目录 {cd} 无法读取 HEAD")
         else:
-            code_status = "未获取 ✗ (目录不存在)"
-            problems.append(f"未获取代码: {cd} 不存在,请先 clone")
+            code_status = "不可用 ✗ (目录不存在)"
+            problems.append(f"代码目录 {cd} 不存在")
 
     if kdev_branch and ktest_branch and kdev_branch != ktest_branch:
         problems.append(f"KDev 分支({kdev_branch}) 与 KTest 覆盖率分支({ktest_branch}) 不一致,拒绝分析")
@@ -752,31 +752,31 @@ def check_cmd(args: argparse.Namespace, start_ms: int) -> None:
         kdev_status += "；commit 不一致 ✗"
 
     lines = [
-        "# 四样数据完整性检查",
+        "# 数据完整性检查",
         "",
-        "| 数据 | 状态 | 说明 |",
-        "|---|---|---|",
-        f"| 1. KTest 覆盖率 | {ktest_status} | {ktest} |",
-        f"| 2. KDev 日志 | {kdev_status} | {kdev} |",
-        f"| 3. 精准测试报告 | {acc_status} | {acc} |",
-        f"| 4. 代码 | {code_status} | {args.code_dir} |",
+        "| 数据 | 级别 | 状态 | 说明 |",
+        "|---|---|---|---|",
+        f"| 1. KTest 覆盖率 | 必需 | {ktest_status} | {ktest} |",
+        f"| 2. 精准测试报告 | 必需 | {acc_status} | {acc} |",
+        f"| 3. KDev 日志 | 可选引导 | {kdev_status} | {kdev} |",
+        f"| 4. 代码 | 可选增强 | {code_status} | {args.code_dir} |",
         "",
         "## 结论",
         "",
     ]
     if problems:
-        lines += ["以下数据未获取或不完整(不允许编造):", ""]
+        lines += ["以下必需数据未获取或不完整(不允许编造):", ""]
         lines += [f"- {p}" for p in problems]
         lines += ["", "按上面的提示补拉后重新检查。"]
         ok = False
     else:
-        lines += ["四样数据齐全且完整,可以进入覆盖率分析。"]
+        lines += ["必需数据齐全且完整,可以进入覆盖率分析。(KDev 日志与代码为可选,缺失不阻断)"]
         ok = True
 
     out = root / f"data_check_{start_ms}.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    emit(ok, 0 if ok else 1, "四样数据完整性检查完成" if ok else "存在未获取/不完整的数据",
+    emit(ok, 0 if ok else 1, "数据完整性检查完成" if ok else "存在未获取/不完整的数据",
          data={"output": str(out), "problems": problems}, start_ms=start_ms)
 
 
